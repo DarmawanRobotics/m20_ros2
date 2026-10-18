@@ -35,8 +35,9 @@ GAIT_NAMES = {
     p.GAIT_STAIR_AGILE: 'stair_agile',
 }
 DEFAULT_FULL_SCALE = (5.0, 2.0, 3.0)    # m/s, m/s, rad/s at axis value 1: calibrate
-MODE_ATTEMPTS = 3                        # regular mode requests at the start of an episode
-MODE_RETRY_SEC = 0.5
+MODE_ATTEMPTS = 3                        # regular mode requests at the start of an episode,
+MODE_RETRY_SEC = 0.5                     # this far apart,
+MODE_WINDOW_SEC = MODE_ATTEMPTS * MODE_RETRY_SEC + MODE_RETRY_SEC   # within this from the first
 OVERSPEED_FACTOR = 1.3                   # reported speed above 1.3 x max_* + 0.1 ...
 OVERSPEED_MARGIN = 0.1
 OVERSPEED_SEC = 0.5                      # ... for this long while driving: disarm
@@ -106,6 +107,7 @@ class _Episode:
 
     request_modes: bool              # navigation mode at the start: ask for regular mode
     attempts: int = 0
+    first_attempt: Optional[float] = None
     last_attempt: Optional[float] = None
     warned_mode: bool = False
 
@@ -414,19 +416,23 @@ class VelocityGate:
         if episode is None:
             return False
         if episode.request_modes and mode == p.USAGE_NAVIGATION:
-            if episode.attempts < MODE_ATTEMPTS:
+            window = (episode.first_attempt is None
+                      or now - episode.first_attempt <= MODE_WINDOW_SEC)
+            if window and episode.attempts < MODE_ATTEMPTS:
                 if episode.last_attempt is None or now - episode.last_attempt >= MODE_RETRY_SEC:
                     out.append((p.USAGE_MODE, p.usage_mode_items(p.USAGE_REGULAR)))
                     episode.attempts += 1
                     episode.last_attempt = now
+                    if episode.first_attempt is None:
+                        episode.first_attempt = now
                 return False
-            if now - episode.last_attempt < MODE_RETRY_SEC:
-                return False
+            if window and now - episode.last_attempt < MODE_RETRY_SEC:
+                return False                    # the last try may still be answered
         if mode is not None and not episode.warned_mode:
             episode.warned_mode = True
             name = p.name_of(p.USAGE_MODES, mode)
-            reason = ('it did not switch after 3 requests' if episode.request_modes
-                      else 'axis commands need regular mode')
+            reason = (f'it did not switch after {episode.attempts} requests'
+                      if episode.request_modes else 'axis commands need regular mode')
             self._events.append(('warn', f'usage mode {name}: {reason}; call regular_mode'))
         return False
 

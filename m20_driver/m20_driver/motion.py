@@ -35,8 +35,9 @@ GAIT_NAMES = {
     p.GAIT_STAIR_AGILE: 'stair_agile',
 }
 DEFAULT_FULL_SCALE = (5.0, 2.0, 3.0)    # m/s, m/s, rad/s at axis value 1: calibrate
-MODE_ATTEMPTS = 3                        # regular mode requests at the start of an episode
-MODE_RETRY_SEC = 0.5
+MODE_ATTEMPTS = 3                        # regular mode requests at the start of an episode,
+MODE_RETRY_SEC = 0.5                     # this far apart,
+MODE_WINDOW_SEC = MODE_ATTEMPTS * MODE_RETRY_SEC + MODE_RETRY_SEC   # within this from the first
 OVERSPEED_FACTOR = 1.3                   # reported speed above 1.3 x max_* + 0.1 ...
 OVERSPEED_MARGIN = 0.1
 OVERSPEED_SEC = 0.5                      # ... for this long while driving: disarm
@@ -106,6 +107,7 @@ class _Episode:
 
     request_modes: bool              # navigation mode at the start: ask for regular mode
     attempts: int = 0
+    first_attempt: Optional[float] = None
     last_attempt: Optional[float] = None
     warned_mode: bool = False
 
@@ -121,6 +123,7 @@ class VelocityGate:
         self._cmd_time: Optional[float] = None         # last Twist, zero or not
         self._motion_time: Optional[float] = None      # last Twist that was motion
         self._holds = set()
+        self._hold_seq = 0                             # bumped by every hold
         self._armed = False
         self._disarm: Optional[str] = None             # shown while a stream is refused
         self._yield_e006 = False
@@ -131,6 +134,7 @@ class VelocityGate:
         self._sent_motion = False
         self._driving = False
         self._burst_until: Optional[float] = None
+        self._zero_owed = False                        # at least one zero after any motion
         self._last_sent: Optional[dict] = None
         self._last_sent_time: Optional[float] = None
         self._over_since: Optional[float] = None
@@ -163,15 +167,32 @@ class VelocityGate:
                 self._arm()
 
     def hold(self, reason: str, now: float):
-        """Stop driving for a service (emergency_stop, sit_down, sleep, ...): zero burst only."""
+        """
+        Stop driving for a service (emergency_stop, sit_down, sleep, ...): zero burst only.
+
+        The burst starts at the next period, so its first zero goes out however late that is.
+        """
         with self._lock:
             self._holds.add(reason)
+            self._hold_seq += 1
             self._armed = False
-            self._stop_motion(now)
 
-    def release(self, reasons=None) -> bool:
-        """Lift the given holds (all when None); motion then needs cmd_vel zero or absent first."""
+    @property
+    def hold_seq(self) -> int:
+        """Return the hold counter: a releasing service takes it when it starts."""
         with self._lock:
+            return self._hold_seq
+
+    def release(self, reasons=None, since: Optional[int] = None) -> bool:
+        """
+        Lift the given holds (all when None); motion then needs cmd_vel zero or absent first.
+
+        since: the hold_seq the releasing service started with; when a hold came in after it
+        (an emergency_stop while stand_up ran), nothing is lifted.
+        """
+        with self._lock:
+            if since is not None and since != self._hold_seq:
+                return False
             before = set(self._holds)
             if reasons is None:
                 self._holds.clear()
@@ -190,7 +211,6 @@ class VelocityGate:
             if not self._yield_e006:
                 self._yield_e006 = True
                 self._armed = False
-                self._stop_motion(now)
                 self._events.append((
                     'warn', 'E006: another client holds the axis channel (2 s rule): cmd_vel is '
                     f'ignored until it has been silent for {self.config.silence_sec:.1f} s'))
@@ -216,7 +236,6 @@ class VelocityGate:
             elif not self._overspeed and now - self._over_since > OVERSPEED_SEC:
                 self._overspeed = True
                 self._armed = False
-                self._stop_motion(now)
                 self._events.append((
                     'error', f'overspeed: reported {", ".join(over)} above 1.3 x max_* + 0.1 for '
                     f'{OVERSPEED_SEC:.1f} s: driving stopped. Calibrate full_scale.'
@@ -257,10 +276,11 @@ class VelocityGate:
             else:
                 self._stop_motion(now)
                 if self._burst_until is not None:
-                    if now < self._burst_until:
+                    if now < self._burst_until or self._zero_owed:
                         zero = p.axis_items()
                         out.append((p.AXIS, zero))
                         self._last_sent, self._last_sent_time = zero, now
+                        self._zero_owed = False
                     else:
                         self._burst_until = None
             self._driving = drive
@@ -285,6 +305,11 @@ class VelocityGate:
             if self._disarm is not None:
                 return f'disarmed:{self._disarm}', True
             return ('driving', False) if self._driving else ('idle', False)
+
+    def record_sent(self, items: dict, now: float):
+        """Note an axis command sent outside tick() (emergency_stop's zero); a burst stays due."""
+        with self._lock:
+            self._last_sent, self._last_sent_time = dict(items), now
 
     @property
     def last_axis(self) -> dict:
@@ -351,10 +376,11 @@ class VelocityGate:
         self._disarm = None
 
     def _stop_motion(self, now: float):
-        """Start the zero burst when the last command sent was motion."""
+        """Start the zero burst in this period when the last command sent was motion."""
         if self._sent_motion:
             self._sent_motion = False
             self._burst_until = now + self.config.stop_burst_sec
+            self._zero_owed = True
 
     def _update_view(self, view: RobotView, now: float):
         self._view = view
@@ -370,7 +396,6 @@ class VelocityGate:
         elif mode is not None and self._regular_seen and not self._latched:
             self._latched = True
             self._armed = False
-            self._stop_motion(now)
             self._events.append((
                 'warn', f'the robot left regular mode ({p.name_of(p.USAGE_MODES, mode)} mode): '
                 'takeover latched, no axis commands or mode requests until it reports regular '
@@ -406,19 +431,23 @@ class VelocityGate:
         if episode is None:
             return False
         if episode.request_modes and mode == p.USAGE_NAVIGATION:
-            if episode.attempts < MODE_ATTEMPTS:
+            window = (episode.first_attempt is None
+                      or now - episode.first_attempt <= MODE_WINDOW_SEC)
+            if window and episode.attempts < MODE_ATTEMPTS:
                 if episode.last_attempt is None or now - episode.last_attempt >= MODE_RETRY_SEC:
                     out.append((p.USAGE_MODE, p.usage_mode_items(p.USAGE_REGULAR)))
                     episode.attempts += 1
                     episode.last_attempt = now
+                    if episode.first_attempt is None:
+                        episode.first_attempt = now
                 return False
-            if now - episode.last_attempt < MODE_RETRY_SEC:
-                return False
+            if window and now - episode.last_attempt < MODE_RETRY_SEC:
+                return False                    # the last try may still be answered
         if mode is not None and not episode.warned_mode:
             episode.warned_mode = True
             name = p.name_of(p.USAGE_MODES, mode)
-            reason = ('it did not switch after 3 requests' if episode.request_modes
-                      else 'axis commands need regular mode')
+            reason = (f'it did not switch after {episode.attempts} requests'
+                      if episode.request_modes else 'axis commands need regular mode')
             self._events.append(('warn', f'usage mode {name}: {reason}; call regular_mode'))
         return False
 

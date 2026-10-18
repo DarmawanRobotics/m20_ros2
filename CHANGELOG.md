@@ -5,6 +5,18 @@ versions follow [SemVer](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed (final review)
+- `m20_driver`: the zero burst after a hold (`navigation_mode`, `assist_mode`, `charge_start`,
+  `sleep`, `sit_down`, ...), an overspeed stop or E006 starts at the next velocity period; before,
+  it started at the event and a late period (or a `stop_burst_sec` shorter than a period) dropped
+  it without a single zero. At least one zero now follows every motion.
+- `m20_driver`: shutdown sends its three zeros whenever the last axis command was motion; before,
+  only within a second of it, while `executor.shutdown()` first waits for blocked services.
+- `m20_driver`: the regular mode tries of an episode stop 2 s after the first; before, a later
+  motion in the same episode could send the rest a minute later.
+- `m20_driver`: `stand_up`, `rl_control` and `regular_mode` no longer lift a hold that came in
+  while they ran (an `emergency_stop` during `stand_up`): a hold counter decides.
+
 ### Safety (after an independent review)
 - `m20_driver`: `cmd_vel` goes through a velocity gate. Axis commands go out only while armed and
   moving (non-zero after the 0.01 rounding), then a zero burst, then silence even while zero
@@ -52,7 +64,7 @@ versions follow [SemVer](https://semver.org).
 - `m20_driver`: the heartbeat pauses while the velocity loop is hung for more than 1 s.
 - `m20_driver`: the sleep settings are read before every `sleep` / `wake`.
 - `m20_driver`: battery error bits named `rear (right)` and `front (left)`.
-- `m20_driver`: shutdown sends three zeros when axis commands went out within the last second.
+- `m20_driver`: shutdown sends three zeros after motion.
 - `m20_description`: `display.launch.py` shows the model in any namespace.
 
 ### Added

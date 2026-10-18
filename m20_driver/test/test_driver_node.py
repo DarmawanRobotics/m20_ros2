@@ -134,12 +134,24 @@ class Rig:
         """Return the X of every axis command the robot received since start."""
         return [items['X'] for items in self.robot.since(start, p.AXIS)]
 
+    def stop_executor(self):
+        """Stop spinning (once)."""
+        if not getattr(self, 'executor_stopped', False):
+            self.executor_stopped = True
+            self.executor.shutdown()
+            self.thread.join(timeout=2.0)
+
+    def destroy_driver(self):
+        """Destroy the driver node (once): its shutdown zeros go out."""
+        if not getattr(self, 'driver_destroyed', False):
+            self.driver_destroyed = True
+            self.node.destroy_node()
+
     def close(self):
         """Stop everything."""
-        self.executor.shutdown()
-        self.thread.join(timeout=2.0)
+        self.stop_executor()
         self.listener.destroy_node()
-        self.node.destroy_node()
+        self.destroy_driver()
         if self.server is not None:
             self.server.close()
 
@@ -569,6 +581,71 @@ def test_direction_back_keeps_cmd_vel_in_base_link(ros):
     rig.stream(twist(0.5, 0.2, 0.3), 0.6)
     assert any(items['X'] == -0.1 and items['Y'] == -0.1 and items['Yaw'] == 0.1
                for items in robot.requests_of(p.AXIS))
+
+
+def test_emergency_stop_during_stand_up_keeps_its_hold(ros):
+    """An emergency_stop landing after stand_up read the state is not lifted by stand_up."""
+    rig = driving_rig(ros)
+    node = rig.node
+    real = node.motion_state
+    me = threading.current_thread()
+    reads = {'n': 0}
+
+    def motion_state():
+        state = real()
+        if threading.current_thread() is me:
+            reads['n'] += 1
+            if reads['n'] == 2:            # stand_up's last state read before it releases
+                node._abort_seq += 1                                   # emergency_stop's
+                node._gate.hold('emergency_stop', time.monotonic())    # first two steps
+        return state
+
+    node.motion_state = motion_state
+    ok, text = node.stand_up(node._abort_seq)
+    assert not ok and 'emergency_stop' in text
+    assert 'emergency_stop' in node._gate.holds
+
+
+def test_rl_control_does_not_lift_a_later_emergency_stop_hold(ros):
+    """The same race for rl_control (its "already in RL control" path)."""
+    rig = driving_rig(ros)
+    node = rig.node
+    real = node.motion_state
+    me = threading.current_thread()
+
+    def motion_state():
+        state = real()
+        if threading.current_thread() is me:
+            node._abort_seq += 1
+            node._gate.hold('emergency_stop', time.monotonic())
+        return state
+
+    node.motion_state = motion_state
+    ok, _ = node.rl_control(node._abort_seq)
+    assert not ok and 'emergency_stop' in node._gate.holds
+
+
+def test_shutdown_after_a_blocked_service_still_sends_zeros(ros):
+    """Stopped while driving and a service blocks: the last axis command is a zero anyway."""
+    rig = start(ros, FakeM20(motion_state=RL), response_timeout_sec=2.5)
+    assert wait_for(lambda: rig.state(connected='true', usage_mode='regular'))
+    rig.stream(twist(), 0.3)
+    driving = rig.stream_in_background(twist(0.5), 1.5)
+    assert wait_for(lambda: any(items['X'] != 0.0 for items in rig.robot.requests_of(p.AXIS)))
+    rig.server.respond = False                       # requests are no longer answered
+    client = rig.listener.create_client(Trigger, 'lights_on')
+    assert client.wait_for_service(timeout_sec=5.0)
+    client.call_async(Trigger.Request())             # blocks the services group for 2.5 s
+    time.sleep(0.3)
+    rig.stop_executor()                              # main(): waits for lights_on, no timer
+    driving.join()
+    last_motion = max(now for now, key, items in list(rig.robot.log)
+                      if key == p.AXIS and items['X'] != 0.0)
+    rig.destroy_driver()                             # main(): then destroy_node()
+    time.sleep(0.3)
+    after = [items for now, key, items in list(rig.robot.log)
+             if key == p.AXIS and now > last_motion]
+    assert after and after[-1]['X'] == 0.0 and len(after) >= 3
 
 
 def test_watchdog_is_not_starved_by_blocking_services(ros):

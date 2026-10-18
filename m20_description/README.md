@@ -15,7 +15,7 @@ ros2 launch m20_description description.launch.py namespace:=m20
 | File | | Arguments |
 |---|---|---|
 | `description.launch.py` | `robot_state_publisher` with the URDF | `namespace` (`m20`) |
-| `display.launch.py` | the above, joint sliders (`joint_state_publisher_gui`) and RViz | `namespace`, `gui` (`true`; `false`: `joint_state_publisher` without sliders) |
+| `display.launch.py` | the above, joint sliders (`joint_state_publisher_gui`) and RViz (its model follows the namespace) | `namespace`, `gui` (`true`; `false`: `joint_state_publisher` without sliders) |
 
 In the namespace, `robot_state_publisher` turns the driver's `joint_states` into TF;
 [m20_bringup](../m20_bringup/README.md) starts both.

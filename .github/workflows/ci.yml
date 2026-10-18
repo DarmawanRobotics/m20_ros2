@@ -1,0 +1,133 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # GUI-only tools: CI builds and tests the packages without them
+  ROSDEP_SKIP: rviz2 joint_state_publisher_gui
+
+jobs:
+  build-test:
+    runs-on: ubuntu-22.04
+    container: ros:foxy-ros-base-focal
+    env:
+      ROS_LOCALHOST_ONLY: '1'
+      PYTHONUNBUFFERED: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src/m20_ros2
+      - name: Dependencies
+        run: |
+          # The image predates the ROS apt key rotation (2025): fetch the current key first.
+          rm -f /etc/apt/sources.list.d/ros2*.list
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates
+          curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+            -o /usr/share/keyrings/ros-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu focal main" \
+            > /etc/apt/sources.list.d/ros2.list
+          apt-get update
+          apt-get install -y --no-install-recommends liburdfdom-tools
+          # Foxy is end-of-life: rosdep skips it unless asked
+          rosdep update --rosdistro foxy --include-eol-distros
+          rosdep install --from-paths src --ignore-src -y --rosdistro foxy \
+            --skip-keys "$ROSDEP_SKIP"
+      - name: Build
+        run: |
+          source /opt/ros/foxy/setup.bash
+          colcon build --event-handlers console_cohesion+
+      - name: Test
+        run: |
+          source /opt/ros/foxy/setup.bash
+          source install/setup.bash
+          # sequential: the in-process ROS tests share one DDS domain
+          colcon test --executor sequential --event-handlers console_cohesion+
+          result=0
+          colcon test-result --verbose > test-result.txt 2>&1 || result=$?
+          cat test-result.txt
+          # the summary (and failures) as annotations, readable without the raw log
+          echo "::notice title=Tests::$(tail -n 1 test-result.txt)"
+          if [ "$result" != 0 ]; then
+            msg=$(head -c 30000 test-result.txt \
+              | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/\n/%0A/g')
+            echo "::error title=Failing tests::$msg"
+            exit 1
+          fi
+      - name: Smoke test (the launch file against the simulated robot)
+        run: |
+          source /opt/ros/foxy/setup.bash
+          source install/setup.bash
+          ros2 launch m20_bringup bringup.launch.py --show-args > /dev/null
+          ros2 launch m20_driver driver.launch.py --show-args > /dev/null
+          ros2 launch m20_description description.launch.py --show-args > /dev/null
+          ros2 launch m20_description display.launch.py --show-args > /dev/null
+          result=0
+          bash src/m20_ros2/m20_driver/test/smoke_test.sh > smoke.txt 2>&1 || result=$?
+          cat smoke.txt
+          echo "::notice title=Smoke test::$(grep -c '^ok' smoke.txt) ok, $(grep -c '^FAIL' smoke.txt) failed"
+          if [ "$result" != 0 ]; then
+            msg=$(head -c 30000 smoke.txt \
+              | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r/%0D/g' -e 's/\n/%0A/g')
+            echo "::error title=Smoke test output::$msg"
+          fi
+          exit "$result"
+      - name: URDF (xacro and check_urdf)
+        run: |
+          source /opt/ros/foxy/setup.bash
+          source install/setup.bash
+          xacro "$(ros2 pkg prefix m20_description)/share/m20_description/urdf/m20.urdf.xacro" \
+            > m20.urdf
+          result=0
+          check_urdf m20.urdf > check_urdf.txt 2>&1 || result=$?
+          cat check_urdf.txt
+          if [ "$result" != 0 ]; then
+            msg=$(sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\n/%0A/g' check_urdf.txt)
+            echo "::error title=check_urdf::$msg"
+          fi
+          exit "$result"
+      - name: Test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build/*/test_results/**/*.xml
+          if-no-files-found: ignore
+
+  checks:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning m20_driver/test/*.sh
+      - name: YAML, JSON and XML parse
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys, xml.dom.minidom, yaml
+          bad = []
+          for p in pathlib.Path('.').rglob('*'):
+              if '.git' in p.parts or not p.is_file():
+                  continue
+              try:
+                  if p.suffix in ('.yaml', '.yml', '.rviz'):
+                      yaml.safe_load(p.read_text())
+                  elif p.suffix == '.json':
+                      json.loads(p.read_text())
+                  elif p.suffix in ('.xml', '.xacro'):
+                      xml.dom.minidom.parse(str(p))
+              except Exception as e:  # noqa: B902
+                  bad.append(f'{p}: {e}')
+          print('\n'.join(bad) or 'all files parse')
+          sys.exit(1 if bad else 0)
+          PY

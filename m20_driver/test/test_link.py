@@ -57,6 +57,62 @@ def test_heartbeat_thread_keeps_the_reports_coming():
     server.close()
 
 
+def test_heartbeat_pauses_while_the_caller_is_hung():
+    """heartbeat_ok False (the ROS side is hung): no heartbeats, reported once each way."""
+    server = FakeServer(FakeM20(), rate_scale=5.0)
+    alive = [True]
+    changes = []
+    link = RobotLink('127.0.0.1', server.port, '127.0.0.1', 0, lambda frame: None,
+                     heartbeat_hz=50.0, heartbeat_ok=lambda: alive[0],
+                     on_heartbeat_pause=changes.append)
+    link.start()
+    try:
+        assert wait_for(lambda: server.heartbeats >= 3)
+        alive[0] = False
+        assert wait_for(lambda: link.heartbeats_paused)
+        count = server.heartbeats
+        time.sleep(0.3)
+        assert server.heartbeats <= count + 1
+        alive[0] = True
+        assert wait_for(lambda: server.heartbeats >= count + 3)
+        assert changes == [True, False] and not link.heartbeats_paused
+    finally:
+        link.stop()
+        server.close()
+
+
+def test_a_second_driver_on_the_same_port_fails():
+    """No SO_REUSEADDR: two links cannot share a fixed local port and split the reports."""
+    first = RobotLink('127.0.0.1', 1, '127.0.0.1', 0, lambda frame: None)
+    first.start()
+    try:
+        second = RobotLink('127.0.0.1', 1, '127.0.0.1', first.local[1], lambda frame: None)
+        with pytest.raises(OSError):
+            second.start()
+    finally:
+        first.stop()
+
+
+def test_reply_with_another_id_reaches_the_request_of_its_kind(rig):
+    """A refusal answered with message ID 0 still fails the request it belongs to."""
+    server, link, _ = rig
+    server.reply_id = 0
+    server.robot.reject[p.CHARGE] = 0xE00A
+    link.next_id()                                  # our request will not have ID 0
+    sent, response = link.request(p.CHARGE, p.charge_items(p.CHARGE_START), timeout=1.0)
+    assert sent and response is not None and response.error_code == 0xE00A
+
+
+def test_request_wait_can_be_aborted(rig):
+    """abort() turning True ends the wait at once, without a response."""
+    server, link, _ = rig
+    server.respond = False
+    start = time.monotonic()
+    sent, response = link.request(p.LIGHTS, p.lights_items(True, True), timeout=2.0,
+                                  abort=lambda: time.monotonic() - start > 0.2)
+    assert sent and response is None and time.monotonic() - start < 1.0
+
+
 def test_request_gets_its_response(rig):
     """The call status response is matched by message ID."""
     server, link, _ = rig

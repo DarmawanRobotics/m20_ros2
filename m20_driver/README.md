@@ -102,7 +102,8 @@ same zero burst, also when the timer resumes late.
   `navigation_mode`, `assist_mode` before they send anything): no axis command and no mode
   request, only the one zero burst. `stand_up` and `rl_control` lift every hold once RL control
   is reported; `regular_mode` lifts only the `navigation_mode` / `assist_mode` hold;
-  `release_emergency_stop` and `wake` lift nothing.
+  `release_emergency_stop` and `wake` lift nothing. A releasing service never lifts a hold that
+  came in while it ran (an `emergency_stop` during `stand_up` stays).
 - **Disarm** by the robot: not in RL control, no reports, hard emergency stop, charging
   (`Charge` 1, 2, 3), no `Direction` reported yet (with `follow_direction`), overspeed (a
   reported speed above 1.3 × `max_*` + 0.1 for 0.5 s while driving: a wrong full scale,
@@ -116,14 +117,16 @@ same zero burst, also when the timer resumes late.
   channel) disarms until `cmd_vel` has been silent for `cmd_timeout_sec + stop_burst_sec`; the
   next motion tries again. `state` says `axis_owner_other` (WARN).
 
-After any of these, motion is sent again only once `cmd_vel` has been zero or absent at least
-once (`disarmed:stale_cmd_vel` until then): a stale stream never drives off. The last reported
+The zero burst starts at the first period that does not drive, so at least one zero follows
+any motion, however late that period runs. After any of these, motion is sent again only once
+`cmd_vel` has been zero or absent at least once (`disarmed:stale_cmd_vel` until then): a stale
+stream never drives off. The last reported
 `Direction` is kept for good; while it is Back, X and Y go out negated so that `cmd_vel` stays
 in `base_link` (1.3.1.1 [2]: positive X then moves towards the hard emergency stop side;
 `follow_direction`).
 
-With `auto_regular_mode` the driver asks for regular mode (up to 3 times, 0.5 s apart) only when
-a motion episode starts (the first motion after `cmd_vel` was silent for `cmd_timeout_sec +
+With `auto_regular_mode` the driver asks for regular mode (up to 3 times, 0.5 s apart, within
+2 s of the first try) only when a motion episode starts (the first motion after `cmd_vel` was silent for `cmd_timeout_sec +
 stop_burst_sec`) while the robot has been in navigation mode since before regular mode was ever
 seen (e.g. after boot) and nothing holds it: never from assist mode or an unknown mode, never
 while charging, never after a takeover. Otherwise it warns once that `regular_mode` must be
@@ -137,8 +140,8 @@ divided by the sent ratio. Set those values in your copy of the parameters.
 
 cmd_vel, the velocity timer, `emergency_stop` and the other services run in separate callback
 groups on five executor threads: a service waiting for the robot never delays the watchdog or
-the emergency stop. On shutdown the driver sends three zeros when axis commands went out within
-the last second.
+the emergency stop. On shutdown the driver sends three zeros when the last axis command it sent
+was motion, however long ago (a blocked service can stop the timer for seconds first).
 
 ## Reports
 

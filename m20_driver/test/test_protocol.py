@@ -183,9 +183,31 @@ def test_error_component_bits_example():
     assert errors[0].parts == ('LeftFrontHipX', 'RightFrontHipY')
     assert errors[0].describe() == (
         '0x8022 joint angle limit exceeded: LeftFrontHipX, RightFrontHipY')
-    assert errors[1].parts == ('left_battery',)
+    assert errors[1].parts == ('front (left) battery',)            # bit 1: left = front
+    assert p.RobotError(0x8102, 0x1).parts == ('rear (right) battery',)
     assert p.RobotError(0x8212, 0xFF).parts == ()
     assert 'CPU temperature overheat protection' in p.RobotError(0x8212, 0).describe()
+
+
+def test_device_temperature_named_fields():
+    """Older firmware names every temperature (LeftFrontHipXMotor, ...): read them too."""
+    temps = {name + 'Motor': 40.0 + i for i, name in enumerate(p.JOINT_ORDER)}
+    temps.update({name + 'Driver': 30.0 for name in p.JOINT_ORDER})
+    d = p.decode_device({'DeviceTemperature': temps})
+    assert d.motor_temperatures == tuple(40.0 + i for i in range(16))
+    assert d.driver_temperatures == (30.0,) * 16
+    assert p.decode_device({'DeviceTemperature': {'LeftFrontHipXMotor': 1.0}}).motor_temperatures \
+        is None
+
+
+def test_state_tables_from_the_sdk():
+    """-1, -2 and 5 (SDK), the charge error 0x1000 (SDK) have names; unknown codes say so."""
+    assert p.name_of(p.MOTION_STATES, -1) == 'motion_program_not_ready'
+    assert p.name_of(p.MOTION_STATES, 5) == 'set_zero'
+    assert p.name_of(p.CHARGE_STATES, 0x1000) == 'charge_error'
+    assert p.name_of(p.MOTION_STATES, 9) == 'unknown (9)'
+    assert p.motion_state_items(p.MOTION_RELEASE_SOFT_ESTOP) == {'MotionParam': -2}
+    assert p.charge_items(p.CHARGE_CANCEL) == {'Charge': 3}
 
 
 def test_general_response():
@@ -196,6 +218,9 @@ def test_general_response():
     assert not response.ok
     assert response.describe() == '0xE006 mismatched request client'
     assert p.decode_response(p.parse_frame(p.encode_response(p.HEARTBEAT, 1))).ok
+    # an ErrorCode sent as a hex string still counts
+    text = p.parse_frame(p.encode(p.AXIS, {'ErrorCode': '0xE006', 'ErrorMessage': ''}, 7))
+    assert p.decode_response(text).error_code == 0xE006
     # status reports are never responses
     report = p.parse_frame(p.encode_report(p.BASIC_STATUS, {'BasicStatus': {}, 'ErrorCode': 0}))
     assert p.decode_response(report) is None

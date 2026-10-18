@@ -1,0 +1,6 @@
+# Same rules as ament_flake8 (colcon test), for editors and pre-commit.
+[flake8]
+max-line-length = 99
+import-order-style = google
+extend-ignore = B902,C816,D100,D101,D102,D103,D104,D105,D106,D107,D203,D212,D404,I202,W503
+exclude = .git,build,install,log

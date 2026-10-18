@@ -58,12 +58,12 @@ for topic in cmd_vel odom imu joint_states battery gps/fix state diagnostics; do
   check "topic $ns/$topic" "^$ns/$topic\$" echo "$topics"
 done
 missing=""
-for service in stand_up sit_down idle damping rl_control emergency_stop gait_basic gait_stair \
-    gait_flat_agile gait_stair_agile regular_mode navigation_mode assist_mode lights_on \
-    lights_off charge_start charge_stop sleep wake sync_time; do
+for service in stand_up sit_down idle damping rl_control emergency_stop release_emergency_stop \
+    gait_basic gait_stair gait_flat_agile gait_stair_agile regular_mode navigation_mode \
+    assist_mode lights_on lights_off charge_start charge_stop charge_cancel sleep wake sync_time; do
   grep -q "^$ns/$service\$" <<<"$services" || missing="$missing $service"
 done
-check "services: all 20" "^none missing$" echo "${missing:-none missing}"
+check "services: all 22" "^none missing$" echo "${missing:-none missing}"
 
 timeout -s INT -k 10 120 python3 "$here/smoke_check.py" --namespace "$ns" || fail=1
 

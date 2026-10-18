@@ -6,6 +6,11 @@ It speaks the inspection protocol over UDP: answers every request with the gener
 status response (same Type, Command and message ID), reports basic (2 Hz), motion (10 Hz),
 device (2 Hz) and abnormal (2 Hz) status to whoever sends heartbeats, and reacts to motion
 state, gait, usage mode, axis, light, charge, sleep and time requests like the robot would.
+Turning integrates Yaw from OmegaZ, in rad or degrees.
+
+For the tests it can misbehave: answer with a wrong message ID (FakeServer.reply_id), stay
+silent (FakeServer.respond), refuse axis commands with E006 (FakeM20.axis_owner_other),
+change its usage mode on its own (set FakeM20.usage_mode) or refuse anything (FakeM20.reject).
 
     python3 fake_robot.py --port 30000        # then: robot_ip:=127.0.0.1
 """
@@ -42,6 +47,8 @@ class FakeM20:
         self.front_light = 0
         self.back_light = 0
         self.direction = 0               # forward direction: 0 front, 1 back (hard e-stop side)
+        self.power_management = 0
+        self.axis_owner_other = False    # another client holds the axis channel: E006
         self.errors = [(0x8001, 0x21)]
         self.angles_in_degrees = angles_in_degrees
         self.extended = extended
@@ -49,10 +56,12 @@ class FakeM20:
         self.axis = dict.fromkeys(p.AXIS_KEYS, 0.0)
         self.axis_time = None
         self.requests = []               # (Type, Command, Items) in arrival order
+        self.log = []                    # (monotonic time, (Type, Command), Items)
         self.reject = {}                 # (Type, Command) -> error code to answer with
         self.synced_time = None
         self._pending = None             # (time, motion_state)
         self.now = 0.0
+        self._last_advance = None
 
     # ------------------------------------------------------------ requests
 
@@ -60,17 +69,23 @@ class FakeM20:
         """Apply one request; return the error code of the call status response."""
         self.advance(now)
         self.requests.append((frame.kind, frame.command, frame.items))
+        self.log.append((now, frame.key, frame.items))
         if frame.key in self.reject:
             return self.reject[frame.key]
         items = frame.items
         if frame.key == p.MOTION_STATE:
-            target = int(items.get('MotionParam', -1))
-            standable = (p.MOTION_SIT, p.MOTION_IDLE, p.MOTION_DAMPING)
+            target = int(items.get('MotionParam', -99))
+            standable = (p.MOTION_SIT, p.MOTION_IDLE, p.MOTION_DAMPING, p.MOTION_SOFT_ESTOP)
             if target == p.MOTION_STAND and self.motion_state in standable:
                 self._pending = (now + self.STAND_SEC, p.MOTION_STAND)
             elif target == p.MOTION_RL_CONTROL and self.motion_state == p.MOTION_STAND:
                 self._pending = (now + self.RL_SEC, p.MOTION_RL_CONTROL)
-            elif target in p.MOTION_STATES:
+            elif target == p.MOTION_RELEASE_SOFT_ESTOP:
+                if self.motion_state != p.MOTION_SOFT_ESTOP:
+                    return 0xE008
+                self.motion_state = p.MOTION_IDLE
+                self._pending = None
+            elif target in (0, 1, 2, 3, 4, 17):
                 self.motion_state = target
                 self._pending = None
             else:
@@ -80,6 +95,8 @@ class FakeM20:
         elif frame.key == p.USAGE_MODE:
             self.usage_mode = int(items.get('Mode', self.usage_mode))
         elif frame.key == p.AXIS:
+            if self.axis_owner_other:
+                return 0xE006
             if self.usage_mode != p.USAGE_REGULAR:
                 return 0xE008
             self.axis = {k: float(items.get(k, 0.0)) for k in p.AXIS_KEYS}
@@ -88,7 +105,13 @@ class FakeM20:
             self.front_light = int(items.get('Front', self.front_light))
             self.back_light = int(items.get('Back', self.back_light))
         elif frame.key == p.CHARGE:
-            self.charge = {0: 3, 1: 1, 2: 0}.get(int(items.get('Charge', 0)), self.charge)
+            command = int(items.get('Charge', 0))
+            if command == p.CHARGE_CANCEL and self.charge == 1:
+                self.charge = 0
+            elif command == p.CHARGE_STOP_EXIT and self.charge == 3:
+                self.charge = 0
+            elif command in (0, 1, 2):
+                self.charge = {0: 3, 1: 1, 2: 0}[command]
         elif frame.key == p.SET_SLEEP:
             self.sleep = 1 if items.get('Sleep') else 0
             self.sleep_auto = bool(items.get('Auto', self.sleep_auto))
@@ -98,17 +121,30 @@ class FakeM20:
         return 0
 
     def advance(self, now: float):
-        """Finish a transition whose time has come; axis commands time out after 0.5 s."""
+        """Finish a transition whose time has come, turn; axis commands time out after 0.5 s."""
+        last, self._last_advance = self._last_advance, now
         self.now = now
         if self._pending is not None and now >= self._pending[0]:
             self.motion_state = self._pending[1]
             self._pending = None
         if self.axis_time is not None and now - self.axis_time > 0.5:
             self.axis = dict.fromkeys(p.AXIS_KEYS, 0.0)
+        if last is not None and 0.0 < now - last < 0.5:
+            self.yaw += self.speeds()[2] * (now - last)
+
+    def speeds(self) -> tuple:
+        """Return (LinearX, LinearY, OmegaZ) of the current axis command (RL control only)."""
+        if not self.moving():
+            return 0.0, 0.0, 0.0
+        return tuple(self.axis[k] * self.FULL_SCALE[k] for k in ('X', 'Y', 'Yaw'))
 
     def requests_of(self, message) -> list:
         """Return the Items of every received request of one (Type, Command)."""
         return [items for kind, command, items in self.requests if (kind, command) == message]
+
+    def since(self, start: float, message) -> list:
+        """Return the Items of the requests of one (Type, Command) received at or after start."""
+        return [items for now, key, items in list(self.log) if now >= start and key == message]
 
     # ------------------------------------------------------------ reports
 
@@ -122,14 +158,12 @@ class FakeM20:
             'MotionState': self.motion_state, 'Gait': self.gait, 'Charge': self.charge,
             'HES': self.hes, 'ControlUsageMode': self.usage_mode, 'Direction': self.direction,
             'OOA': 0,
-            'PowerManagement': 0, 'Sleep': self.sleep, 'Version': 'STD',
+            'PowerManagement': self.power_management, 'Sleep': self.sleep, 'Version': 'STD',
         }}
 
     def motion_items(self) -> dict:
         """Return the Items of the motion control status report."""
-        vx = self.axis['X'] * self.FULL_SCALE['X'] if self.moving() else 0.0
-        vy = self.axis['Y'] * self.FULL_SCALE['Y'] if self.moving() else 0.0
-        wz = self.axis['Yaw'] * self.FULL_SCALE['Yaw'] if self.moving() else 0.0
+        vx, vy, wz = self.speeds()
         scale = 57.29577951308232 if self.angles_in_degrees else 1.0
         status = {
             'Roll': 0.01 * scale, 'Pitch': -0.02 * scale, 'Yaw': self.yaw * scale,
@@ -193,6 +227,7 @@ class FakeServer:
         self.client = None
         self.heartbeats = 0
         self.rate_scale = rate_scale
+        self.reply_id = None            # None: the request's message ID; else always this one
         self._lock = threading.Lock()
         self._next = dict.fromkeys(self.RATES, 0.0)
         self._id = 0
@@ -224,8 +259,10 @@ class FakeServer:
                             self.heartbeats += 1
                         code = self.robot.handle(frame, now)
                         if self.respond:
-                            self.sock.sendto(p.encode_response(frame.key, frame.message_id,
-                                                               code), address)
+                            reply_id = (frame.message_id if self.reply_id is None
+                                        else self.reply_id)
+                            self.sock.sendto(p.encode_response(frame.key, reply_id, code),
+                                             address)
                         if frame.key == p.GET_SLEEP:
                             self.sock.sendto(p.encode_report(p.GET_SLEEP,
                                                              self.robot.sleep_items(),

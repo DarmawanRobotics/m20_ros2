@@ -33,7 +33,7 @@ own ROS 2 topics (custom `drdds` types, on its hosts only) are not needed.
 
 | Package | |
 |---|---|
-| [`m20_driver`](m20_driver/README.md) | the protocol driver: `cmd_vel` → axis commands in regular mode; reports → `odom`, `imu`, `joint_states`, `battery`, `gps/fix`, `state`, `diagnostics`; every robot command as a `std_srvs/Trigger` service; a simulated robot for trying it without one |
+| [`m20_driver`](m20_driver/README.md) | the protocol driver: `cmd_vel` through a velocity gate (holds, takeover latch, E006, watchdog) → axis commands in regular mode; reports → `odom`, `imu`, `joint_states`, `battery`, `gps/fix`, `state`, `diagnostics`; every robot command as a `std_srvs/Trigger` service that succeeds only when the robot confirmed it; a simulated robot for trying it without one |
 | [`m20_description`](m20_description/README.md) | URDF: Deep Robotics' model with its meshes (BSD-3-Clause), front/rear camera and LiDAR frames, `imu_link` |
 | [`m20_bringup`](m20_bringup/README.md) | one launch for the driver and the URDF, RViz on request |
 
@@ -43,12 +43,12 @@ From the protocol document V1.3.0-0:
 
 | | |
 |---|---|
-| robot | UDP server **10.21.31.103:30000** (the TCP server on 30001 is not used) |
+| robot | UDP server **10.21.31.103:30000** on the wired payload network (the TCP server on 30001 is not used); the official remote app talks to `10.21.33.103` (SDK `IpConfig`) |
 | messages | 16-byte header `EB 91 EB 90`, ASDU length and message ID (little endian), `0x01` = JSON; then `{"PatrolDevice": {"Type", "Command", "Time", "Items"}}` |
 | heartbeat | Type 100 / Command 100, at least 1 Hz (the driver sends 5 Hz) |
 | reports | to whoever sends the heartbeat: basic status 2 Hz, motion status 10 Hz, device status 2 Hz, abnormal status 2 Hz |
 | answers | a call status response (ErrorCode, ErrorMessage) to every request |
-| velocity | axis command Type 2 / Command 21, ratios in [-1, 1], **regular usage mode only**, moves the robot in RL control; from one client at a time |
+| velocity | axis command Type 2 / Command 21, ratios in [-1, 1], 20 Hz recommended, **regular usage mode only**, moves the robot in RL control; from **one client within 2 s** (E006) |
 
 Nothing has to be configured on the robot: it reports to the address and port the heartbeats come
 from. This computer only needs a route to `10.21.31.103` (`ping 10.21.31.103`).
@@ -83,8 +83,9 @@ python3 $(ros2 pkg prefix m20_driver)/share/m20_driver/test/fake_robot.py --port
 ros2 launch m20_bringup bringup.launch.py robot_ip:=127.0.0.1 rviz:=true
 ```
 
-Then work through [Verify on the real robot](#verify-on-the-real-robot), including the speed
-calibration and the `cmd_vel` signs (steps 5 to 7), before any autonomy drives the robot.
+Then work through [Verify on the real robot](#verify-on-the-real-robot), including the
+emergency stop, the takeover, the speed calibration and the `cmd_vel` signs (steps 4 to 10),
+before any autonomy drives the robot.
 
 ## Interface
 
@@ -92,24 +93,26 @@ Everything under `/m20` (launch argument `namespace`).
 
 | | Name | Type | |
 |---|---|---|---|
-| sub | `cmd_vel` | `geometry_msgs/Twist` | REP-103 in `base_link`; zeros 0.5 s after the last command, then nothing |
+| sub | `cmd_vel` | `geometry_msgs/Twist` | REP-103 in `base_link`; sent only while armed and moving, then zeros for 0.5 s, then nothing (also while zero Twists keep coming); held by services, a takeover or E006 ([velocity gate](m20_driver/README.md#velocity)) |
 | pub | `odom` | `nav_msgs/Odometry` | `odom` → `base_link`, dead-reckoned from the reported velocities and heading; no TF unless `publish_tf` |
-| pub | `imu` | `sensor_msgs/Imu` | attitude, rates (and acceleration on newer firmware), frame `imu_link` |
+| pub | `imu` | `sensor_msgs/Imu` | attitude once the angle unit is known, rates (and acceleration on newer firmware), frame `imu_link` |
 | pub | `joint_states` | `sensor_msgs/JointState` | 12 leg angles and 4 wheels, named as in the URDF |
 | pub | `battery` | `sensor_msgs/BatteryState` | both batteries, `percentage` 0–1 |
 | pub | `gps/fix` | `sensor_msgs/NavSatFix` | the robot's GPS |
-| pub | `state` | `diagnostic_msgs/DiagnosticStatus` | connected, motion state, gait, usage mode, charge, e-stop, sleep, battery ... as key/values |
+| pub | `state` | `diagnostic_msgs/DiagnosticStatus` | connected, motion state, `velocity` (driving, idle, hold, disarmed, takeover, axis_owner_other), gait, usage mode, charge, e-stop, sleep, battery ... as key/values |
 | pub | `diagnostics` | `diagnostic_msgs/DiagnosticArray` | driver and link, robot errors (the document's error table), temperatures, power |
 
-**Services** (`std_srvs/Trigger`; each waits for the robot's answer, a refusal fails the call
-with the robot's error code):
+**Services** (`std_srvs/Trigger`): success only when the robot confirmed the command (its call
+status response, and for motion states the reported state); no answer is `unconfirmed`, a refusal
+fails with the robot's error code.
 
 | | |
 |---|---|
-| posture | `stand_up` (Stand, then RL control), `sit_down`, `idle`, `damping`, `rl_control`, `emergency_stop` (soft) |
-| gaits | `gait_basic`, `gait_stair` (standard), `gait_flat_agile`, `gait_stair_agile` (agile) |
+| posture | `stand_up` (Stand, then RL control), `sit_down`, `idle`, `damping`, `rl_control` |
+| stop | `emergency_stop` (soft, confirmed or an ERROR), `release_emergency_stop` (from the SDK, not in V1.3.0) |
+| gaits | `gait_basic`, `gait_stair` (standard), `gait_flat_agile`, `gait_stair_agile` (agile); in RL control and regular mode |
 | usage modes | `regular_mode`, `navigation_mode`, `assist_mode` |
-| other | `lights_on`, `lights_off`, `charge_start`, `charge_stop`, `sleep`, `wake`, `sync_time` |
+| other | `lights_on`, `lights_off`, `charge_start`, `charge_stop`, `charge_cancel` (from the SDK), `sleep`, `wake`, `sync_time` |
 
 ## Usage
 
@@ -119,13 +122,14 @@ ros2 service call /m20/stand_up std_srvs/srv/Trigger
 ros2 service call /m20/gait_flat_agile std_srvs/srv/Trigger      # agile gait: for autonomy
 ros2 topic pub -r 10 /m20/cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.3}}"
 
-# stop, sit, lights, docking
+# stop (cmd_vel stays held until stand_up or rl_control), sit, lights, docking
 ros2 service call /m20/emergency_stop std_srvs/srv/Trigger
+ros2 service call /m20/release_emergency_stop std_srvs/srv/Trigger
 ros2 service call /m20/sit_down std_srvs/srv/Trigger
 ros2 service call /m20/lights_on std_srvs/srv/Trigger
 ros2 service call /m20/charge_start std_srvs/srv/Trigger
 
-# state, errors, temperatures, speed estimates
+# state (velocity: why cmd_vel does or does not drive), errors, temperatures, speed estimates
 ros2 topic echo /m20/state
 ros2 topic echo /m20/diagnostics
 ```
@@ -142,46 +146,79 @@ remote and the hard emergency stop:
 
 1. **Reports:** `ros2 topic hz /m20/odom` shows ~10 Hz and `/m20/state` says `connected: true`
    with the real motion state and gait.
-2. **Angle unit:** turn the robot 90° by remote: the yaw of `/m20/imu` (and `/m20/odom`) must
-   change by about 1.57 rad. `state.angle_unit` reads `deg` if the robot sends degrees (the
-   driver switches by itself); set `angles_in_degrees` to match so it holds from the first report.
+2. **Angle unit:** drive a turn faster than 0.3 rad/s: `state.angle_unit` becomes `rad (auto)` or
+   `deg (auto)` (the document says rad, the official client degrees). Turn 90° by remote: the yaw
+   of `/m20/imu` changes by about 1.57 rad. Then set `angle_unit` to that unit.
 3. **Stand:** `ros2 service call /m20/stand_up std_srvs/srv/Trigger` answers `standing in RL
    control`. Note from which states the robot accepts Stand.
-4. **Regular mode:** with `auto_regular_mode: true` (default) `state.usage_mode` turns `regular`
-   when `cmd_vel` starts; close the official app's control first (one client: `0xE006`).
-5. **Forward:** `ros2 topic pub -r 10 /m20/cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.2}}"`
+4. **Emergency stop:** while driving, `emergency_stop` answers `soft emergency stop confirmed` and
+   the robot stops. Then find out what releases it: `release_emergency_stop` (MotionParam −2,
+   from the SDK) or `stand_up` straight from state 2 (the SDK allows Stand there). `cmd_vel`
+   stays held until `stand_up` or `rl_control`, and then needs a zero first.
+5. **Regular mode and takeover:** with `auto_regular_mode` (default) a robot that was in
+   navigation mode since boot is switched to regular when `cmd_vel` starts. While streaming,
+   switch to navigation in the app: the driver stops, `state.velocity` says `takeover
+   (navigation mode)` and it never switches back by itself. Hand back to regular in the app (or
+   call `regular_mode`): it drives again after `cmd_vel` was zero once.
+6. **One axis client:** while the driver streams, the remote's joystick is locked out (E006, 2 s
+   rule); after the stop burst the driver is quiet and the remote works again. Use the remote's
+   joystick while `cmd_vel` streams: `state.velocity` shows `axis_owner_other` and the driver
+   yields until `cmd_vel` pauses.
+7. **Forward:** `ros2 topic pub -r 10 /m20/cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.2}}"`
    moves it forward, slowly (uncalibrated). Stop the publisher: it stops within 0.5 s.
-6. **Calibrate speeds:** drive steadily (e.g. `x: 0.5`, then `y: 0.2`, then `angular: {z: 0.5}`)
-   and read `full_scale_vx_estimate`, `_vy_`, `_wz_` in `/m20/diagnostics` (reported speed over
-   sent ratio). Put them into `full_scale_vx`, `full_scale_vy`, `full_scale_wz` of your
-   parameters; `odom`'s twist then matches `cmd_vel`.
-7. **Turn and strafe (REP-103):** `{angular: {z: 0.3}}` must turn the robot **left**
+8. **Calibrate speeds per gait:** in each gait, drive steadily (e.g. `x: 0.5`, then `y: 0.2`,
+   then `angular: {z: 0.5}`) and read `full_scale.<gait>.vx_estimate` (`vy`, `wz`) in
+   `/m20/diagnostics`. Put them into `full_scale.<gait>.vx`, `.vy`, `.wz` of your parameters;
+   `odom`'s twist then matches `cmd_vel`. A gait far faster than its full scale trips the
+   overspeed guard (`disarmed:overspeed`).
+9. **Turn and strafe (REP-103):** `{angular: {z: 0.3}}` must turn the robot **left**
    (counter-clockwise seen from above), else set `invert_wz: true`; `{linear: {y: 0.1}}` must
-   move it **left**, else `invert_vy: true`. If you set the robot's forward direction to Back
-   (`state.direction`), check that `x: 0.2` still moves it towards its front (the driver negates
-   X and Y then, `follow_direction`) and that `odom` still counts forward.
-8. **Joints and frames:** `ros2 launch m20_bringup bringup.launch.py rviz:=true`: the legs of the
-   model move like the real ones (joint signs against the URDF axes) and the wheels turn the
-   right way. The model gives the rear camera and rear LiDAR no rotation: check their frames
-   against their data.
-9. **Batteries and GPS:** `battery.location` lists `rear, front` (the official client's order of
-   `BatteryList`); compare the percentages with the app. Outdoors, `gps/fix` shows a fix
-   (`FixQuality` read as NMEA: 1 GPS, 2 differential, 4/5 RTK).
-10. **Sleep and charging:** `sleep` / `wake` keep the robot's own auto-sleep settings (read with
-   1101/7); `charge_start` near the dock, `charge_stop` after.
+   move it **left**, else `invert_vy: true`.
+10. **Direction Back:** set the robot's forward direction to Back (`state.direction`): `x: 0.2`
+    must still move it towards its front and `y: 0.1` to its left (the driver negates X and Y,
+    `follow_direction`), and `odom`'s twist must still read positive x. If it reads negative,
+    set `direction_flips_reports: true` (the diagnostics warn about it after 2 s).
+11. **Joints and frames:** `ros2 launch m20_bringup bringup.launch.py rviz:=true`: the legs of
+    the model move like the real ones (joint signs against the URDF axes) and the wheels turn
+    the right way. The model gives the rear camera and rear LiDAR no rotation: check their frames
+    against their data.
+12. **Batteries and GPS:** `battery.location` lists `rear, front` (the official client's order of
+    `BatteryList`); compare the percentages with the app. Outdoors, `gps/fix` shows a fix
+    (`FixQuality` read as NMEA) and an altitude: find out whether it is above sea level or the
+    ellipsoid.
+13. **Sleep and charging:** `sleep` / `wake` keep the robot's own auto-sleep settings (read with
+    1101/7 every time); `charge_start` near the dock; `charge_cancel` while it goes to the dock,
+    `charge_stop` while charging or on the dock (the SDK's meaning of Charge 0).
+14. **Lost controller:** stop the driver while it streams: three zeros go out. Its heartbeat also
+    pauses when the driver hangs: check what the robot does then (the SDK knows error 0x8309,
+    controller heartbeat timeout).
 
 ## Safety
 
-- The driver stops on its own: no `cmd_vel` for 0.5 s gives zeros, then silence. Only one node
-  (your control mux) should publish on `/m20/cmd_vel`.
-- `emergency_stop` zeroes the velocity and sends the soft emergency stop; the remote and the
+- The driver stops on its own: no `cmd_vel` for 0.5 s gives zeros for 0.5 s, then silence, and a
+  stream of zero Twists sends nothing. Only one node (your control mux) should publish on
+  `/m20/cmd_vel`.
+- `emergency_stop` holds `cmd_vel` first, sends a zero and the soft emergency stop three times,
+  and succeeds only when the robot confirms it; otherwise it fails with `soft e-stop NOT
+  confirmed` and logs an ERROR. It aborts any service that is still waiting. The remote and the
   robot's hard emergency stop always work too.
-- Until the speeds are calibrated the robot runs slower than `cmd_vel` asks (high `full_scale_*`
-  defaults); `max_vx`, `max_vy`, `max_wz` clamp every command.
-- `sit_down`, `idle` and `damping` are refused while `cmd_vel` moves the robot. Idle and damping
-  change how the joints hold: use them with the robot sitting.
-- With `auto_regular_mode` the driver switches the robot to regular mode when motion starts: do
-  not run it while the robot's own navigation is driving.
+- `emergency_stop`, `sit_down`, `idle`, `damping`, `sleep`, `charge_start`, `navigation_mode` and
+  `assist_mode` hold `cmd_vel`; only `stand_up` / `rl_control` (and `regular_mode` for the mode
+  holds) lift it, and a running stream then has to be zero once: a stale stream never drives off.
+- A takeover (the robot leaves regular mode after it was in regular mode: the app, the remote,
+  the robot) latches: no axis command and no mode request until the robot reports regular mode
+  again. The driver never switches a robot back that someone else switched away.
+- While the driver streams, the remote's joystick is locked out (the robot takes axis commands
+  from one client within 2 s); after the stop burst the driver is quiet. When another client
+  holds the axis channel (E006) the driver yields until `cmd_vel` pauses.
+- No service reports success without the robot's answer (and for motion states the reported
+  state).
+- Until the speeds are calibrated the robot runs slower than `cmd_vel` asks (high
+  `full_scale.<gait>.*` defaults); `max_vx`, `max_vy`, `max_wz` clamp every command, and a
+  reported speed far above them stops the stream (overspeed).
+- `sit_down`, `idle` and `damping` are refused while the robot walks; `idle` and `damping` only
+  from a sitting state. `stand_up` is refused on a hard emergency stop or while charging.
+- Invalid parameters stop the driver before it contacts the robot.
 - `charge_start` makes the robot dock by itself.
 
 ## Develop
@@ -191,9 +228,11 @@ colcon build && colcon test --executor sequential && colcon test-result --verbos
 ```
 
 The codec is tested against the document's header layout and JSON examples and the official
-Android client's framing; the UDP link, the velocity policy and the node run against a simulated
-M20 on the loopback interface (`m20_driver/test/fake_robot.py`); the URDF against the official
-model's numbers and the driver's joint names. CI runs the same in a `ros:foxy` container, plus
+Android client's framing; every rule of the velocity gate has a unit test; the UDP link and the
+node run against a simulated M20 on the loopback interface (`m20_driver/test/fake_robot.py`),
+which can also answer with wrong message IDs, stay silent, refuse with E006, change its usage
+mode on its own and report degrees; the URDF against the official model's numbers and the
+driver's joint names. CI runs the same in a `ros:foxy` container, plus
 an end-to-end smoke test of the installed launch file against the simulator, `check_urdf` and
 shellcheck.
 

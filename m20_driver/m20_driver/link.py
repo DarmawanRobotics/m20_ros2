@@ -10,10 +10,14 @@ from typing import Callable, Dict, List, Optional, Tuple
 from m20_driver import protocol as p
 
 
-class _Pending:
+class Pending:
     """A request waiting for its call status response."""
 
-    def __init__(self):
+    def __init__(self, message_id: int, key: Tuple[int, int], sent_at: float):
+        """Remember the request's ID, (Type, Command) and send time."""
+        self.message_id = message_id
+        self.key = key
+        self.sent_at = sent_at
         self.event = threading.Event()
         self.response: Optional[p.Response] = None
 
@@ -23,7 +27,9 @@ class RobotLink:
     One UDP socket: requests go to the robot, which reports back to this socket's port.
 
     A receive thread hands every frame on; with heartbeat_hz > 0 a heartbeat thread keeps the
-    robot reporting to this socket (1.2.1: at least 1 Hz), whatever the caller is doing.
+    robot reporting to this socket (1.2.1: at least 1 Hz). heartbeat_ok, when given, is asked
+    before every heartbeat: while it returns False (the caller is hung) heartbeats pause, so the
+    robot notices the lost controller; on_heartbeat_pause(paused) reports the changes.
     """
 
     def __init__(
@@ -35,6 +41,8 @@ class RobotLink:
         on_frame: Callable[[p.Frame], None],
         poll_sec: float = 0.2,
         heartbeat_hz: float = 0.0,
+        heartbeat_ok: Optional[Callable[[], bool]] = None,
+        on_heartbeat_pause: Optional[Callable[[bool], None]] = None,
     ):
         """Store the addresses; nothing is opened until start()."""
         self.remote = (host, int(port))
@@ -42,13 +50,16 @@ class RobotLink:
         self._on_frame = on_frame
         self._poll_sec = poll_sec
         self._heartbeat_hz = float(heartbeat_hz)
+        self._heartbeat_ok = heartbeat_ok
+        self._on_heartbeat_pause = on_heartbeat_pause
+        self.heartbeats_paused = False
         self._sock: Optional[socket.socket] = None
         self._threads: List[threading.Thread] = []
         self._running = threading.Event()
         self._stopping = threading.Event()
         self._lock = threading.Lock()
         self._ids = itertools.count()
-        self._pending: Dict[int, _Pending] = {}
+        self._pending: Dict[int, Pending] = {}
         self.heartbeats = 0
         self.rx_count = 0
         self.tx_count = 0
@@ -62,8 +73,7 @@ class RobotLink:
     def start(self):
         """Bind the socket and start the receive (and heartbeat) thread."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(self.local)
+        sock.bind(self.local)       # no SO_REUSEADDR: a second driver on the port must fail
         sock.setblocking(False)
         self._sock = sock
         self.local = sock.getsockname()
@@ -109,18 +119,13 @@ class RobotLink:
         self.tx_count += 1
         return message_id
 
-    def request(self, message: Tuple[int, int], items: Optional[dict] = None,
-                timeout: float = 1.0) -> Tuple[bool, Optional[p.Response]]:
-        """
-        Send a request and wait for its call status response.
-
-        Return (sent, response); response is None when none arrived within the timeout.
-        """
-        pending = _Pending()
+    def submit(self, message: Tuple[int, int], items: Optional[dict] = None) -> Optional[Pending]:
+        """Send a request and register it for its call status response; None when not sent."""
         sock = self._sock
         if sock is None:
-            return False, None
+            return None
         message_id = self.next_id()
+        pending = Pending(message_id, (int(message[0]), int(message[1])), time.monotonic())
         with self._lock:
             self._pending[message_id] = pending
         try:
@@ -130,14 +135,43 @@ class RobotLink:
         except (OSError, ValueError) as error:
             self.tx_errors += 1
             self.last_error = str(error)
-            with self._lock:
-                self._pending.pop(message_id, None)
-            return False, None
+            self.forget(pending)
+            return None
         self.tx_count += 1
-        pending.event.wait(timeout)
+        return pending
+
+    def forget(self, pending: Pending):
+        """Stop waiting for a request's response."""
         with self._lock:
-            self._pending.pop(message_id, None)
-        return True, pending.response
+            if self._pending.get(pending.message_id) is pending:
+                del self._pending[pending.message_id]
+
+    def wait(self, pending: Pending, timeout: float,
+             abort: Optional[Callable[[], bool]] = None) -> Optional[p.Response]:
+        """Wait for a submitted request's response; None on timeout or when abort() turns True."""
+        end = time.monotonic() + timeout
+        try:
+            while True:
+                left = end - time.monotonic()
+                if left <= 0.0 or (abort is not None and abort()):
+                    return pending.response
+                if pending.event.wait(min(left, 0.05)):
+                    return pending.response
+        finally:
+            self.forget(pending)
+
+    def request(self, message: Tuple[int, int], items: Optional[dict] = None,
+                timeout: float = 1.0,
+                abort: Optional[Callable[[], bool]] = None) -> Tuple[bool, Optional[p.Response]]:
+        """
+        Send a request and wait for its call status response.
+
+        Return (sent, response); response is None when none arrived within the timeout.
+        """
+        pending = self.submit(message, items)
+        if pending is None:
+            return False, None
+        return True, self.wait(pending, timeout, abort)
 
     def age(self, now: Optional[float] = None) -> float:
         """Return seconds since the last frame from the robot, infinity before the first."""
@@ -157,11 +191,17 @@ class RobotLink:
         if response is not None:
             if not response.ok:
                 self.last_failure = response
+            key = (response.kind, response.command)
             with self._lock:
                 pending = self._pending.get(response.message_id)
-            if pending is not None and pending.response is None:
-                pending.response = response
-                pending.event.set()
+                if pending is None or pending.key != key or pending.response is not None:
+                    # an ID that matches nothing waiting: the oldest request of the same kind
+                    waiting = [q for q in self._pending.values()
+                               if q.key == key and q.response is None]
+                    pending = min(waiting, key=lambda q: q.sent_at) if waiting else None
+                if pending is not None:
+                    pending.response = response
+                    pending.event.set()
         self._on_frame(frame)
 
     def _heartbeat_loop(self):
@@ -169,7 +209,12 @@ class RobotLink:
         period = 1.0 / self._heartbeat_hz
         due = time.monotonic()
         while self._running.is_set():
-            if self.send(p.HEARTBEAT) is not None:
+            ok = self._heartbeat_ok is None or self._heartbeat_ok()
+            if ok == self.heartbeats_paused:
+                self.heartbeats_paused = not ok
+                if self._on_heartbeat_pause is not None:
+                    self._on_heartbeat_pause(self.heartbeats_paused)
+            if ok and self.send(p.HEARTBEAT) is not None:
                 self.heartbeats += 1
             due += period
             delay = due - time.monotonic()

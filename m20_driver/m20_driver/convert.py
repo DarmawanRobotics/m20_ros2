@@ -31,42 +31,97 @@ def finite_or(value: Optional[float], default: float) -> float:
     return value if math.isfinite(value) else default
 
 
-class AngleUnit:
+class AngleUnitDetector:
     """
-    Radians as the document says, degrees once a reported angle cannot be radians.
+    Unit of the reported Roll/Pitch/Yaw: configured, or found from the yaw rate.
 
-    The protocol document gives Roll/Pitch/Yaw in rad, the official Android client calls them
-    degrees. A magnitude above 2*pi only fits degrees: from then on they are converted.
+    The protocol document says rad, the official Android client calls them degrees and shows
+    them with a degree sign. In auto mode the unwrapped change of Yaw is compared with the
+    integrated OmegaZ (rad/s) during steady turns (|OmegaZ| > 0.3 rad/s): a ratio near 57.3 means
+    degrees, near 1 radians. Five agreeing windows decide, then the unit is kept for the run.
     """
 
-    def __init__(self, degrees: bool = False):
-        """Start with the configured unit."""
-        self.degrees = bool(degrees)
-        self.switched = False
+    MIN_RATE = 0.3          # rad/s: only turns this fast count
+    WINDOW = 0.15           # rad of integrated OmegaZ per comparison
+    TOLERANCE = 0.2         # relative
+    VOTES = 5
+    MAX_STEP_SEC = 0.5
 
-    def observe(self, *angles: Optional[float]) -> bool:
-        """Look at reported angles; return True when this call switched to degrees."""
-        if self.degrees:
-            return False
-        if any(a is not None and math.isfinite(a) and abs(a) > TWO_PI + 1e-3 for a in angles):
-            self.degrees = True
-            self.switched = True
-            return True
-        return False
-
-    def radians(self, value: Optional[float]) -> float:
-        """Return a reported angle as radians, 0 when missing."""
-        value = finite_or(value, 0.0)
-        return math.radians(value) if self.degrees else value
+    def __init__(self, mode: str = 'auto'):
+        """Start with mode auto (unknown until found), rad or deg."""
+        if mode not in ('auto', 'rad', 'deg'):
+            raise ValueError(f'angle unit {mode!r}: auto, rad or deg')
+        self.mode = mode
+        self.unit: Optional[str] = None if mode == 'auto' else mode
+        self._last: Optional[Tuple[float, float, float]] = None   # time, yaw, omega_z
+        self._sums = [0.0, 0.0, 0.0]                              # deg, rad, integrated omega
+        self._streak: Tuple[Optional[str], int] = (None, 0)
 
     @property
     def name(self) -> str:
-        """Return 'deg' or 'rad'."""
-        return 'deg' if self.degrees else 'rad'
+        """Return the unit for the state: rad, deg, or 'rad|deg|unknown (auto)'."""
+        if self.mode != 'auto':
+            return self.mode
+        return f'{self.unit or "unknown"} (auto)'
+
+    def _restart(self):
+        self._sums = [0.0, 0.0, 0.0]
+
+    def observe(self, now: float, yaw: Optional[float], omega_z: Optional[float]) -> Optional[str]:
+        """Feed one motion report; return the unit when this report decided it."""
+        if self.unit is not None:
+            return None
+        if yaw is None or omega_z is None or not (math.isfinite(yaw) and math.isfinite(omega_z)):
+            self._last = None
+            self._restart()
+            return None
+        last, self._last = self._last, (now, yaw, omega_z)
+        if last is None or abs(omega_z) <= self.MIN_RATE or abs(last[2]) <= self.MIN_RATE:
+            self._restart()
+            return None
+        dt = now - last[0]
+        if not 0.0 < dt <= self.MAX_STEP_SEC:
+            self._restart()
+            return None
+        change = yaw - last[1]
+        self._sums[0] += math.remainder(change, 360.0)
+        self._sums[1] += math.remainder(change, TWO_PI)
+        self._sums[2] += 0.5 * (omega_z + last[2]) * dt
+        if abs(self._sums[2]) < self.WINDOW:
+            return None
+        degrees, radians, turned = self._sums
+        self._restart()
+        if abs(degrees / turned / math.degrees(1.0) - 1.0) < self.TOLERANCE:
+            vote = 'deg'
+        elif abs(radians / turned - 1.0) < self.TOLERANCE:
+            vote = 'rad'
+        else:
+            self._streak = (None, 0)
+            return None
+        unit, count = self._streak
+        count = count + 1 if unit == vote else 1
+        self._streak = (vote, count)
+        if count >= self.VOTES:
+            self.unit = vote
+            return vote
+        return None
+
+    def radians(self, value: Optional[float]) -> Optional[float]:
+        """Return a reported angle in radians, None while the unit is unknown."""
+        if self.unit is None:
+            return None
+        value = finite_or(value, 0.0)
+        return math.radians(value) if self.unit == 'deg' else value
 
 
 class Odometry2D:
-    """Planar dead reckoning from body velocities and the reported heading."""
+    """
+    Planar dead reckoning from body velocities and a heading.
+
+    The heading is the reported Yaw once its unit is known, before that the integrated OmegaZ.
+    When the reported heading takes over, it is offset to continue where the integration was,
+    so the published heading never jumps.
+    """
 
     def __init__(self, max_step_sec: float = 0.5):
         """Start at the origin; gaps longer than max_step_sec are not integrated."""
@@ -75,27 +130,35 @@ class Odometry2D:
         self.y = 0.0
         self.yaw = 0.0
         self._last: Optional[float] = None
+        self._offset: Optional[float] = None
 
     def reset(self):
         """Go back to the origin."""
         self.x = self.y = self.yaw = 0.0
         self._last = None
+        self._offset = None
 
-    def update(self, now: float, vx: float, vy: float, yaw: float) -> bool:
+    def update(self, now: float, vx: float, vy: float, heading: Optional[float] = None,
+               rate: Optional[float] = None) -> bool:
         """
         Integrate body velocities (m/s) over the time since the last update.
 
-        yaw (rad) is the heading the robot reports; the pose turns with it. Return False when
-        the step was skipped (first sample, a gap, or time going backwards).
+        heading (rad): the reported Yaw, None while its unit is unknown; rate (rad/s): OmegaZ,
+        integrated while there is no heading. Return False when the step was skipped (first
+        sample, a gap, or time going backwards).
         """
         last, self._last = self._last, now
-        self.yaw = yaw
-        if last is None:
+        dt = None if last is None else now - last
+        valid = dt is not None and 0.0 < dt <= self.max_step_sec
+        if heading is not None:
+            if self._offset is None:
+                self._offset = self.yaw - heading if last is not None else 0.0
+            self.yaw = math.remainder(heading + self._offset, TWO_PI)
+        elif valid and rate is not None and math.isfinite(rate):
+            self.yaw = math.remainder(self.yaw + rate * dt, TWO_PI)
+        if not valid:
             return False
-        dt = now - last
-        if dt <= 0.0 or dt > self.max_step_sec:
-            return False
-        c, s = math.cos(yaw), math.sin(yaw)
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
         self.x += (c * vx - s * vy) * dt
         self.y += (s * vx + c * vy) * dt
         return True
@@ -147,13 +210,14 @@ def gps_status(fix_quality: float) -> int:
     """
     Return the sensor_msgs/NavSatStatus status of an NMEA fix quality.
 
-    0 no fix (-1), 1 GPS (0), 2 differential (1, SBAS), 4/5 RTK (2, GBAS).
+    1 GPS and 3 PPS: fix (0); 2 differential: SBAS (1); 4 RTK fixed and 5 RTK float: GBAS (2);
+    anything else (0 invalid, 6 dead reckoning, 7 manual, 8 simulation): no fix (-1).
     """
     quality = int(round(finite_or(fix_quality, 0.0)))
-    if quality <= 0:
-        return -1
+    if quality in (1, 3):
+        return 0
     if quality == 2:
         return 1
     if quality in (4, 5):
         return 2
-    return 0
+    return -1

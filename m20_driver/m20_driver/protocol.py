@@ -72,12 +72,19 @@ MOTION_SOFT_ESTOP = 2
 MOTION_DAMPING = 3
 MOTION_SIT = 4
 MOTION_RL_CONTROL = 17
+# From the SDK, not in V1.3.0 (RobotProtocol.motionMsg, RobotStatesExpansion, ControlActivity):
+MOTION_NOT_READY = -1             # reported: the motion program is not running yet
+MOTION_RELEASE_SOFT_ESTOP = -2    # request: leave the soft emergency stop (sendExitDampingMode)
+MOTION_SET_ZERO = 5               # reported: joint zero calibration
 MOTION_STATES = {
+    -2: 'soft_emergency_stop_released',
+    -1: 'motion_program_not_ready',
     0: 'idle',
     1: 'stand',
     2: 'soft_emergency_stop',
     3: 'power_on_damping',
     4: 'sit',
+    5: 'set_zero',
     17: 'rl_control',
 }
 
@@ -94,9 +101,11 @@ GAITS = {
     0x3003: 'stair_agile',
 }
 
-CHARGE_STOP = 0
+CHARGE_STOP = 0                   # the SDK: end / leave charging, valid while charging (2, 5)
 CHARGE_START = 1
 CHARGE_CLEAR = 2                  # forcibly cuts the current and resets: not offered by the driver
+CHARGE_CANCEL = 3                 # from the SDK, not in V1.3.0: cancel going to the dock
+CHARGE_STOP_EXIT = 4              # from the SDK, not in V1.3.0: stop leaving the dock
 CHARGE_STATES = {
     0: 'idle',
     1: 'entering_dock',
@@ -104,7 +113,9 @@ CHARGE_STATES = {
     3: 'exiting_dock',
     4: 'error',
     5: 'on_dock_not_charging',
+    0x1000: 'charge_error',       # from the SDK, not in V1.3.0
 }
+CHARGING_STATES = (1, 2, 3)       # docking, charging, leaving the dock: not to be driven
 HES_STATES = {0: 'not_triggered', 1: 'triggered'}
 DIRECTIONS = {0: 'front', 1: 'back'}
 OOA_STATES = {0: 'not_started', 1: 'idle', 2: 'not_triggered', 3: 'avoiding'}
@@ -181,9 +192,9 @@ ERROR_CODES = {
     0x8509: 'dock entry timeout during autonomous charging',
     0x8510: 'dock withdrawal timeout during autonomous charging',
 }
-# Battery component bits (1.3.2 [7]): bit 0 the right battery (hard emergency stop side), bit 1
-# the left one.
-BATTERY_PARTS = ('right_battery', 'left_battery')
+# Battery component bits (1.3.2 [7]): bit 0 the right battery, bit 1 the left one. 1.3.1.3 [4]
+# puts the right battery on the hard emergency stop side, the rear: BatteryList[0] is the same one.
+BATTERY_PARTS = ('rear (right) battery', 'front (left) battery')
 
 # General protocol interface call status (1.5)
 RESPONSE_CODES = {
@@ -408,7 +419,13 @@ def _num(data: dict, key: str, kind=float, default=None):
     try:
         return kind(float(value)) if kind is int else kind(value)
     except (TypeError, ValueError):
-        return default
+        pass
+    if kind is int and isinstance(value, str):
+        try:
+            return int(value.strip(), 0)          # '0xE006'
+        except ValueError:
+            pass
+    return default
 
 
 def _floats(values, count: int) -> Optional[Tuple[float, ...]]:
@@ -604,6 +621,18 @@ def _batteries(items: dict) -> Tuple[Battery, ...]:
     return tuple(out)
 
 
+def _temperatures(temps: dict, kind: str) -> Optional[Tuple[float, ...]]:
+    """
+    Return the 16 Motor or Driver temperatures: the array, else the named fields.
+
+    Older firmware sends LeftFrontHipXMotor, LeftFrontHipXDriver, ... (the SDK still reads them).
+    """
+    values = _floats(temps.get(kind), len(JOINT_ORDER))
+    if values is None and all(name + kind in temps for name in JOINT_ORDER):
+        values = _floats([temps[name + kind] for name in JOINT_ORDER], len(JOINT_ORDER))
+    return values
+
+
 def decode_device(items: dict) -> DeviceStatus:
     """Decode Items of the device state report."""
     if not isinstance(items, dict):
@@ -642,8 +671,8 @@ def decode_device(items: dict) -> DeviceStatus:
                             _num(h, 'FrequencyApp', default=float('nan'))))
     return DeviceStatus(
         batteries=_batteries(items),
-        motor_temperatures=_floats(temps.get('Motor'), len(JOINT_ORDER)),
-        driver_temperatures=_floats(temps.get('Driver'), len(JOINT_ORDER)),
+        motor_temperatures=_temperatures(temps, 'Motor'),
+        driver_temperatures=_temperatures(temps, 'Driver'),
         front_light=_num(fill, 'Front', int),
         back_light=_num(fill, 'Back', int),
         gps=gps,

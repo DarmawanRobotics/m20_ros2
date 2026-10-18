@@ -3,7 +3,9 @@
 End-to-end checks of a running m20_driver against test/fake_robot.py (run by smoke_test.sh).
 
 One ROS node for all of it: short-lived command line tools killed by a timeout leave stale
-DDS state behind on Foxy, which made checks after the first few fail at random.
+DDS state behind on Foxy, which made checks after the first few fail at random. Topics, state,
+stand_up, lights, cmd_vel and its watchdog, emergency_stop holding cmd_vel, and
+release_emergency_stop (which does not lift the hold).
 
     python3 smoke_check.py --namespace /m20
 
@@ -156,8 +158,18 @@ class Checker:
                    timeout=5.0, detail=self.state)
 
         self.check_call('emergency_stop')
-        self.check('state: soft emergency stop',
-                   lambda: self.state().get('motion_state') == 'soft_emergency_stop',
+        self.check('state: soft emergency stop, cmd_vel held',
+                   lambda: (self.state().get('motion_state') == 'soft_emergency_stop'
+                            and self.state().get('velocity') == 'hold:emergency_stop'),
+                   detail=self.state)
+        self.drive(twist, 1.5)
+        self.check('cmd_vel: nothing sent while held',
+                   lambda: self.state().get('cmd_axis') == '0.00 0.00 0.00', timeout=1.0,
+                   detail=self.state)
+        self.check_call('release_emergency_stop')
+        self.check('state: soft emergency stop released, still held',
+                   lambda: (self.state().get('motion_state') not in (None, 'soft_emergency_stop')
+                            and self.state().get('velocity') == 'hold:emergency_stop'),
                    detail=self.state)
         return self.failed
 

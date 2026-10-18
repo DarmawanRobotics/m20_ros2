@@ -123,6 +123,7 @@ class VelocityGate:
         self._cmd_time: Optional[float] = None         # last Twist, zero or not
         self._motion_time: Optional[float] = None      # last Twist that was motion
         self._holds = set()
+        self._hold_seq = 0                             # bumped by every hold
         self._armed = False
         self._disarm: Optional[str] = None             # shown while a stream is refused
         self._yield_e006 = False
@@ -173,11 +174,25 @@ class VelocityGate:
         """
         with self._lock:
             self._holds.add(reason)
+            self._hold_seq += 1
             self._armed = False
 
-    def release(self, reasons=None) -> bool:
-        """Lift the given holds (all when None); motion then needs cmd_vel zero or absent first."""
+    @property
+    def hold_seq(self) -> int:
+        """Return the hold counter: a releasing service takes it when it starts."""
         with self._lock:
+            return self._hold_seq
+
+    def release(self, reasons=None, since: Optional[int] = None) -> bool:
+        """
+        Lift the given holds (all when None); motion then needs cmd_vel zero or absent first.
+
+        since: the hold_seq the releasing service started with; when a hold came in after it
+        (an emergency_stop while stand_up ran), nothing is lifted.
+        """
+        with self._lock:
+            if since is not None and since != self._hold_seq:
+                return False
             before = set(self._holds)
             if reasons is None:
                 self._holds.clear()

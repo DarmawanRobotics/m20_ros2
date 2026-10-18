@@ -645,8 +645,18 @@ class M20DriverNode(Node):
         self.get_logger().error(text)
         return False, text
 
+    def lift_holds(self, seq: int, holds: int, reasons=None):
+        """Lift holds unless emergency_stop (or any hold) came in since; error text or None."""
+        if self.aborted(seq):
+            return 'aborted by emergency_stop: cmd_vel stays held'
+        self._gate.release(reasons, since=holds)
+        if self._gate.hold_seq != holds:
+            return 'a hold came in meanwhile (emergency_stop): cmd_vel stays held'
+        return None
+
     def stand_up(self, seq: int):
         """Stand, then RL control; lifts every hold once RL control is reported."""
+        holds = self._gate.hold_seq          # a hold after this point is never lifted here
         basic = self.latest_basic()
         if not self.connected():
             return False, 'no reports from the robot'
@@ -674,7 +684,9 @@ class M20DriverNode(Node):
             message = 'standing in RL control'
         else:
             message = 'already in RL control'
-        self._gate.release()
+        error = self.lift_holds(seq, holds)
+        if error is not None:
+            return False, f'{message}, but {error}'
         if self._stand_up_gait:
             ok, text = self.gait_handler(f'gait_{self._stand_up_gait}',
                                          GAIT_PARAMS[self._stand_up_gait])(seq)
@@ -683,6 +695,7 @@ class M20DriverNode(Node):
 
     def rl_control(self, seq: int):
         """RL control (from standing); lifts every hold once it is reported."""
+        holds = self._gate.hold_seq
         if self.motion_state() != p.MOTION_RL_CONTROL:
             ok, text = self.go_to(p.MOTION_RL_CONTROL, self._rl_timeout, seq)
             if not ok:
@@ -690,7 +703,9 @@ class M20DriverNode(Node):
             message = 'rl_control'
         else:
             message = 'already in RL control'
-        self._gate.release()
+        error = self.lift_holds(seq, holds)
+        if error is not None:
+            return False, f'{message}, but {error}'
         return True, message
 
     def release_emergency_stop(self, seq: int):
@@ -752,10 +767,13 @@ class M20DriverNode(Node):
 
     def regular_mode(self, seq: int):
         """Regular usage mode; lifts a navigation_mode or assist_mode hold once confirmed."""
+        holds = self._gate.hold_seq
         ok, text = self.call(p.USAGE_MODE, p.usage_mode_items(p.USAGE_REGULAR),
                              'regular_mode sent', seq)
         if ok:
-            self._gate.release(NAV_HOLDS)
+            error = self.lift_holds(seq, holds, NAV_HOLDS)
+            if error is not None:
+                text += f', but {error}'
         return ok, text
 
     def query_sleep(self, seq: int):

@@ -20,14 +20,14 @@ ros2 launch m20_bringup bringup.launch.py robot_ip:=127.0.0.1    # against the f
 |---|---|---|
 | `namespace` | `m20` | driver topics and services, `robot_state_publisher` |
 | `robot_ip` | empty | the robot's address; empty: `driver_params` (`10.21.31.103`) |
-| `driver_params` | [`m20_driver/config/driver_params.yaml`](../m20_driver/config/driver_params.yaml) | a copy with this robot's settings (calibrated `full_scale_*`, sign fixes, frames) |
+| `driver_params` | [`m20_driver/config/driver_params.yaml`](../m20_driver/config/driver_params.yaml) | a copy with this robot's settings (calibrated `full_scale.<gait>.*`, `angle_unit`, sign fixes, frames) |
 | `rviz` | `false` | RViz with the robot model |
 
 ## Nodes
 
 | Node | Namespace | |
 |---|---|---|
-| `m20_driver` | `m20` | `cmd_vel` in; `odom`, `imu`, `joint_states`, `battery`, `gps/fix`, `state`, `diagnostics`; Trigger services ([m20_driver](../m20_driver/README.md)) |
+| `m20_driver` | `m20` | `cmd_vel` in (through the velocity gate); `odom`, `imu`, `joint_states`, `battery`, `gps/fix`, `state`, `diagnostics`; confirmed Trigger services ([m20_driver](../m20_driver/README.md)) |
 | `robot_state_publisher` | `m20` | `robot_description`, TF `base_link` → legs, wheels, `imu_link`, cameras, LiDARs ([m20_description](../m20_description/README.md)) |
 | `rviz2` (`rviz:=true`) | root | the model and TF |
 

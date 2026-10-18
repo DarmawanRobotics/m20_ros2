@@ -151,4 +151,6 @@ colcon test --packages-select m20_driver && colcon test-result --verbose
 The codec is checked against the document's own header layout and JSON examples and against
 the official Android client's framing (header, axis rounding); the link, the velocity policy and
 the node run against `test/fake_robot.py` on the loopback interface. `test/smoke_test.sh` runs
-the installed launch file against the simulator with the `ros2` command line (CI does both).
+the installed launch file against the simulator: the `ros2` command line checks the graph and a
+service call, `test/smoke_check.py` (one node) the topics, the services, `cmd_vel` and its
+watchdog (CI does both).

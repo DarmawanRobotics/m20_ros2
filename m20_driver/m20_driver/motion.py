@@ -93,7 +93,7 @@ class VelocityPolicy:
 
     def axis(self, vx: float, vy: float, wz: float, reverse: bool = False) -> dict:
         """
-        Items of the axis command for a velocity (REP-103 in, REP-103 out).
+        Return the Items of the axis command for a velocity (REP-103 in and out).
 
         reverse: the robot's forward direction is Back (1.3.1.1 [2]: positive X then moves
         towards the hard emergency stop side), so X and Y are negated to stay in base_link. The

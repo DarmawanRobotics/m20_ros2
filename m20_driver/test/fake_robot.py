@@ -117,7 +117,7 @@ class FakeM20:
         return self.motion_state == p.MOTION_RL_CONTROL
 
     def basic_items(self) -> dict:
-        """Items of the basic status report."""
+        """Return the Items of the basic status report."""
         return {'BasicStatus': {
             'MotionState': self.motion_state, 'Gait': self.gait, 'Charge': self.charge,
             'HES': self.hes, 'ControlUsageMode': self.usage_mode, 'Direction': self.direction,
@@ -126,7 +126,7 @@ class FakeM20:
         }}
 
     def motion_items(self) -> dict:
-        """Items of the motion control status report."""
+        """Return the Items of the motion control status report."""
         vx = self.axis['X'] * self.FULL_SCALE['X'] if self.moving() else 0.0
         vy = self.axis['Y'] * self.FULL_SCALE['Y'] if self.moving() else 0.0
         wz = self.axis['Yaw'] * self.FULL_SCALE['Yaw'] if self.moving() else 0.0
@@ -146,7 +146,7 @@ class FakeM20:
         return {'MotionStatus': status, 'MotorStatus': motor}
 
     def device_items(self) -> dict:
-        """Items of the device state report."""
+        """Return the Items of the device state report."""
         return {
             'BatteryList': [
                 {'Voltage': 50.1, 'BatteryLevel': 80, 'battery_temperature': 31.0,
@@ -167,11 +167,11 @@ class FakeM20:
         }
 
     def error_items(self) -> dict:
-        """Items of the abnormal status report."""
+        """Return the Items of the abnormal status report."""
         return {'ErrorList': [{'errorCode': c, 'component': part} for c, part in self.errors]}
 
     def sleep_items(self) -> dict:
-        """Items of the sleep settings reply (1101/7)."""
+        """Return the Items of the sleep settings reply (1101/7)."""
         return {'Sleep': self.sleep, 'Auto': self.sleep_auto, 'Time': self.sleep_minutes}
 
 

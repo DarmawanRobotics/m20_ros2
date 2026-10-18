@@ -360,37 +360,37 @@ def axis_items(x: float = 0.0, y: float = 0.0, yaw: float = 0.0, z: float = 0.0,
 
 
 def usage_mode_items(mode: int) -> dict:
-    """Items of a usage mode switch."""
+    """Return the Items of a usage mode switch."""
     return {'Mode': int(mode)}
 
 
 def motion_state_items(state: int) -> dict:
-    """Items of a motion state switch."""
+    """Return the Items of a motion state switch."""
     return {'MotionParam': int(state)}
 
 
 def gait_items(gait: int) -> dict:
-    """Items of a gait switch."""
+    """Return the Items of a gait switch."""
     return {'GaitParam': int(gait)}
 
 
 def lights_items(front: bool, back: bool) -> dict:
-    """Items of the flashlight command."""
+    """Return the Items of the flashlight command."""
     return {'Front': 1 if front else 0, 'Back': 1 if back else 0}
 
 
 def charge_items(charge: int) -> dict:
-    """Items of the autonomous charging command."""
+    """Return the Items of the autonomous charging command."""
     return {'Charge': int(charge)}
 
 
 def sleep_items(sleep: bool, auto: bool, minutes: int) -> dict:
-    """Items of the sleep settings (minutes in [5, 30])."""
+    """Return the Items of the sleep settings (minutes in [5, 30])."""
     return {'Sleep': bool(sleep), 'Auto': bool(auto), 'Time': int(max(5, min(30, minutes)))}
 
 
 def time_sync_items(now: Optional[float] = None) -> dict:
-    """Items of the external time synchronization: this computer's local time."""
+    """Return the Items of the external time synchronization: this computer's time."""
     return {'Time': local_time(now)}
 
 
@@ -570,7 +570,7 @@ def _bool(value) -> Optional[bool]:
 
 
 def _batteries(items: dict) -> Tuple[Battery, ...]:
-    """Batteries from BatteryList ([0] rear, [1] front) or else BatteryStatus (Left/Right)."""
+    """Return the batteries of BatteryList ([0] rear, [1] front), else of BatteryStatus."""
     out: List[Battery] = []
     listed = items.get('BatteryList')
     if isinstance(listed, dict):

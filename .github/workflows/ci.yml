@@ -102,7 +102,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: build/*/test_results/**/*.xml
+          path: |
+            build/*/test_results/**/*.xml
+            build/*/pytest.xml
           if-no-files-found: ignore
 
   checks:

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end smoke test: the installed driver (launch file + params file) against
-# test/fake_robot.py on the loopback interface, checked with the ros2 command line.
-# Topics, the state, stand_up, cmd_vel and its watchdog, a plain command, emergency_stop.
+# test/fake_robot.py on the loopback interface. The ros2 command line checks the graph and one
+# service call; test/smoke_check.py (one ROS node) checks topics, state, stand_up, cmd_vel and
+# its watchdog, a plain command and emergency_stop.
 # Needs a sourced workspace (ROS 2 Foxy or later).
 set -u
-# ros2 output into a pipe is block-buffered and lost when timeout stops it
+# python output into a pipe is block-buffered and lost when the process is stopped
 export PYTHONUNBUFFERED=1
 
+here="$(cd "$(dirname "$0")" && pwd)"
 share="$(ros2 pkg prefix m20_driver)/share/m20_driver"
 work="$(mktemp -d)"
 port=30000
@@ -35,10 +37,6 @@ check() {  # check <name> <pattern> <command...>: the command's output must matc
   fi
 }
 
-echo_for() {  # echo_for <seconds> <topic>: what ros2 topic echo prints in that time (Foxy: no --once)
-  timeout "$1" ros2 topic echo "$2" 2>&1
-}
-
 # the installed parameters, pointed at the fake robot
 sed -e "s/^\(\s*robot_ip:\).*/\1 127.0.0.1/" -e "s/^\(\s*robot_port:\).*/\1 $port/" \
   "$share/config/driver_params.yaml" > "$work/params.yaml"
@@ -52,35 +50,25 @@ for _ in $(seq 1 30); do
   ros2 topic list 2>/dev/null | grep -q "^$ns/state$" && break
   sleep 1
 done
-sleep 2
 
-check "state: connected, sitting" "message: sit, basic, regular mode" echo_for 6 $ns/state
-check "odom" "child_frame_id: base_link" echo_for 5 $ns/odom
-check "imu" "frame_id: imu_link" echo_for 5 $ns/imu
-check "joint_states" "hr_wheel_joint" echo_for 5 $ns/joint_states
-check "battery" "percentage: 0.8" echo_for 6 $ns/battery
-check "gps/fix" "latitude: -6.2" echo_for 6 $ns/gps/fix
-check "diagnostics: robot errors" "motor temperature warning" echo_for 6 $ns/diagnostics
+# the graph: every topic and service of the driver (the command line exits by itself)
+topics="$(ros2 topic list 2>&1)"
+services="$(ros2 service list 2>&1)"
+for topic in cmd_vel odom imu joint_states battery gps/fix state diagnostics; do
+  check "topic $ns/$topic" "^$ns/$topic\$" echo "$topics"
+done
+missing=""
+for service in stand_up sit_down idle damping rl_control emergency_stop gait_basic gait_stair \
+    gait_flat_agile gait_stair_agile regular_mode navigation_mode assist_mode lights_on \
+    lights_off charge_start charge_stop sleep wake sync_time; do
+  grep -q "^$ns/$service\$" <<<"$services" || missing="$missing $service"
+done
+check "services: all 20" "^none missing$" echo "${missing:-none missing}"
 
-check "stand_up" "success=True, message='standing in RL control'" \
-  timeout 45 ros2 service call $ns/stand_up std_srvs/srv/Trigger
-check "lights_on" "success=True" timeout 30 ros2 service call $ns/lights_on std_srvs/srv/Trigger
+timeout -s INT -k 10 120 python3 "$here/smoke_check.py" --namespace "$ns" || fail=1
 
-# 0.5 m/s, 0.2 m/s, 0.3 rad/s over the default full scales (5, 2, 3) are ratios of 0.1; the
-# fake robot runs 2 m/s at X = 1, so it reports 0.2 m/s
-timeout 14 ros2 topic pub -r 10 $ns/cmd_vel geometry_msgs/msg/Twist \
-  "{linear: {x: 0.5, y: 0.2}, angular: {z: 0.3}}" > /dev/null 2>&1 &
-publisher=$!
-sleep 3
-check "cmd_vel: axis ratios sent" "value: '?0.10 0.10 0.10'?" echo_for 4 $ns/state
-check "cmd_vel: the robot moves" "x: 0.2" echo_for 4 $ns/odom
-wait "$publisher"
-sleep 2   # cmd_vel stopped: zeros after cmd_timeout_sec, then nothing
-check "cmd_vel: watchdog zeros" "value: '?0.00 0.00 0.00'?" echo_for 4 $ns/state
-
-check "emergency_stop" "success=True" \
-  timeout 30 ros2 service call $ns/emergency_stop std_srvs/srv/Trigger
-check "state: soft emergency stop" "soft_emergency_stop" echo_for 6 $ns/state
+check "ros2 service call lights_off" "success=True" \
+  timeout -s INT -k 5 45 ros2 service call $ns/lights_off std_srvs/srv/Trigger
 
 if grep -qE "Traceback|process has died" "$work/launch.log"; then
   echo "FAIL driver log"

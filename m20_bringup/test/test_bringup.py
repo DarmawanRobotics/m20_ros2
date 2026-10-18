@@ -35,11 +35,26 @@ def actions_for(**args) -> list:
     return module.launch_setup(context)
 
 
+def text(value) -> str:
+    """Return a launch value (a string or a list of text substitutions) as a string."""
+    if isinstance(value, str):
+        return value
+    return ''.join(getattr(s, 'text', str(s)) for s in value or [])
+
+
 def nodes(actions) -> list:
-    """Return (package, executable) of every Node action."""
+    """Return (package, executable) of every Node action (Foxy has no node_package property)."""
     from launch_ros.actions import Node
 
-    return [(a.node_package, a.node_executable) for a in actions if isinstance(a, Node)]
+    found = []
+    for action in actions:
+        if isinstance(action, Node):
+            attributes = vars(action)
+            package = next(v for k, v in attributes.items() if k.endswith('__package'))
+            executable = next(v for k, v in attributes.items()
+                              if k.endswith(('__node_executable', '__executable')))
+            found.append((text(package), text(executable)))
+    return found
 
 
 def test_arguments():

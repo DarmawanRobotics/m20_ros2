@@ -2,6 +2,7 @@
 
 from m20_driver import protocol as p
 from m20_driver.motion import (
+    is_motion,
     NAV_HOLDS,
     ratio,
     RobotView,
@@ -143,6 +144,105 @@ def test_starved_timer_still_sends_the_burst():
     assert axes(run(g, 5.5, 6.5)) == []
 
 
+@pytest.mark.parametrize('reason', ['navigation_mode', 'assist_mode', 'charge_start', 'sleep',
+                                    'sit_down'])
+def test_hold_then_a_late_period_still_sends_a_zero(reason):
+    """The burst starts at the next period: a zero goes out even 0.64 s after the hold."""
+    g = gate()
+    g.command(0.5, 0.0, 0.0, 0.0)
+    assert is_motion(axes(g.tick(0.05, view()))[0])
+    g.hold(reason, 0.06)                                     # the services thread
+    later = []
+    for t in (0.7, 0.75, 0.8, 2.0):                          # 0.64 s late, then on time
+        later += axes(g.tick(t, view()))
+    assert later and not is_motion(later[0])
+    assert all(not is_motion(items) for items in later)
+
+
+def test_hold_with_a_stop_burst_shorter_than_a_period_still_sends_a_zero():
+    """stop_burst_sec 0.02 at 20 Hz: still one zero after the hold."""
+    g = VelocityGate(VelocityConfig(stop_burst_sec=0.02))
+    g.tick(0.0, view())
+    g.command(0.5, 0.0, 0.0, 0.0)
+    assert is_motion(axes(g.tick(0.05, view()))[0])
+    g.hold('charge_start', 0.06)
+    later = []
+    for i in range(2, 40):
+        later += axes(g.tick(round(0.05 * i, 2), view()))
+    assert len(later) == 1 and not is_motion(later[0])
+
+
+def test_overspeed_then_a_late_period_still_sends_a_zero():
+    """The overspeed disarm comes from the receive thread: the next period sends the zero."""
+    g = gate()
+    t = 0.0
+    while t < 0.6:
+        g.command(0.5, 0.0, 0.0, t)
+        assert is_motion(axes(g.tick(t, view()))[0])
+        g.observe_speed(t, 3.0, 0.0, 0.0)
+        t = round(t + 0.05, 2)
+    g.observe_speed(0.62, 3.0, 0.0, 0.0)
+    later = []
+    for t in (1.2, 1.25, 2.0):                               # 0.6 s late
+        later += axes(g.tick(t, view()))
+    assert later and not any(is_motion(items) for items in later)
+
+
+def test_e006_then_a_late_period_still_sends_a_zero():
+    """E006 arrives on the receive thread: the next period still sends a zero."""
+    g = gate()
+    g.command(0.5, 0.0, 0.0, 0.0)
+    assert is_motion(axes(g.tick(0.05, view()))[0])
+    g.axis_refused(0xE006, 0.06)
+    later = axes(g.tick(0.9, view()))                        # 0.84 s late
+    assert later and not is_motion(later[0])
+
+
+def test_a_zero_burst_follows_every_motion_whatever_the_timing():
+    """After any motion at least one zero goes out, for any lateness of the next period."""
+    for late in (0.01, 0.05, 0.3, 0.6, 2.0, 30.0):
+        for stop in ('stale', 'zero', 'hold', 'takeover', 'e006'):
+            if stop == 'stale' and late <= 0.5:
+                continue                                     # still fresh: still driving
+            g = gate()
+            g.command(0.5, 0.0, 0.0, 0.0)
+            g.tick(0.05, view())
+            robot = view()
+            if stop == 'zero':
+                g.command(0.0, 0.0, 0.0, 0.06)
+            elif stop == 'hold':
+                g.hold('sleep', 0.06)
+            elif stop == 'takeover':
+                robot = view(usage_mode=p.USAGE_NAVIGATION)
+            elif stop == 'e006':
+                g.axis_refused(0xE006, 0.06)
+            out = axes(g.tick(0.05 + late, robot))
+            assert out and not is_motion(out[0]), (late, stop)
+
+
+def test_record_sent_keeps_the_burst_due():
+    """emergency_stop's own zero is recorded; the timer's burst still follows."""
+    g = gate()
+    g.command(0.5, 0.0, 0.0, 0.0)
+    g.tick(0.05, view())
+    g.hold('emergency_stop', 0.06)
+    g.record_sent(p.axis_items(), 0.06)
+    assert not is_motion(g.last_axis)
+    assert axes(g.tick(0.1, view())) == [p.axis_items()]
+
+
+def test_release_since_keeps_a_hold_that_came_in_later():
+    """A releasing service lifts nothing when a hold came in after it started."""
+    g = gate()
+    g.hold('sit_down', 0.0)
+    started = g.hold_seq                                     # stand_up starts
+    g.hold('emergency_stop', 0.1)                            # e-stop while it runs
+    assert not g.release(since=started)
+    assert g.holds == ('emergency_stop', 'sit_down')
+    assert g.release(since=g.hold_seq)
+    assert g.holds == ()
+
+
 def test_nonfinite_twist_is_a_stop():
     """A NaN in any field: zeros (the burst) and a throttled warning, not the other fields."""
     g = gate()
@@ -266,6 +366,25 @@ def test_regular_mode_requested_at_the_start_only_while_never_seen():
     out = run(g2, 0.05, 0.3, robot=nav, cmd=(0.5, 0.0, 0.0))
     assert modes(out) == [p.USAGE_REGULAR]
     assert set(xs(run(g2, 0.3, 0.6, cmd=(0.5, 0.0, 0.0)))) == {0.1}   # no zero needed
+
+
+def test_regular_mode_tries_are_bounded_in_time():
+    """Tries only within MODE_WINDOW_SEC of the first: none 60 s later in the same episode."""
+    g = VelocityGate(VelocityConfig())
+    nav = view(usage_mode=p.USAGE_NAVIGATION)
+    g.tick(0.0, nav)
+    g.command(0.5, 0.0, 0.0, 0.05)
+    assert modes(g.tick(0.05, nav)) == [p.USAGE_REGULAR]          # try 1
+    late = []
+    t = 0.05
+    while t < 60.0:                                                # zeros keep the episode
+        t = round(t + 0.1, 2)
+        g.command(0.0, 0.0, 0.0, t)
+        late += modes(g.tick(t, nav))
+    g.command(0.5, 0.0, 0.0, 60.1)                                 # it moves again
+    late += modes(g.tick(60.1, nav))
+    assert late == []
+    assert any('did not switch after 1 requests' in text for _, text in g.drain_events())
 
 
 def test_no_mode_request_from_assist_unknown_held_or_charging():

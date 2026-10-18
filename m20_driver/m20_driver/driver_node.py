@@ -512,8 +512,13 @@ class M20DriverNode(Node):
             for message, items in self._gate.tick(now, view):
                 self._link.send(message, items)
         for level, text in self._gate.drain_events():
-            {'info': self.get_logger().info, 'warn': self.get_logger().warn,
-             'error': self.get_logger().error}[level](text)
+            # one call site per severity: rclpy refuses a severity change at the same line
+            if level == 'error':
+                self.get_logger().error(text)
+            elif level == 'warn':
+                self.get_logger().warn(text)
+            else:
+                self.get_logger().info(text)
 
     def watch_connection(self):
         """Log when reports start and stop; read the sleep settings on every (re)connect."""

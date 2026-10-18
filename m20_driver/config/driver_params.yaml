@@ -1,41 +1,65 @@
 # m20_driver: the Lynx M20 over its inspection protocol (UDP, JSON; Deep Robotics
-# "Inspection Communication Protocol" V1.3.0).
+# "Inspection Communication Protocol" V1.3.0). The driver checks every value at start: an
+# invalid one stops it (ERROR on the state topic, the robot is not contacted).
 # "/**" matches the driver in any namespace and under any node name.
 /**:
   ros__parameters:
     # Network: requests go to the robot's UDP server; the robot reports to whoever sends the
     # heartbeat (this socket), so nothing has to be configured on the robot.
-    robot_ip: 10.21.31.103
+    robot_ip: 10.21.31.103            # wired payload network (the official remote uses .33.103)
     robot_port: 30000
     local_ip: 0.0.0.0
     local_port: 0                     # 0: any free port
-    heartbeat_hz: 5.0                 # document: at least 1 Hz; the official client: 5 Hz
+    heartbeat_hz: 5.0                 # document: at least 1 Hz (below: 1 Hz with a warning);
+                                      # pauses while the velocity loop is hung for > 1 s
 
     # Velocity: cmd_vel (base_link, REP-103) -> axis commands (2/21) with X, Y, Yaw as ratios
-    # of the robot's maximum speed. They only work in regular usage mode and move the robot in
-    # RL control (stand_up gets it there).
-    cmd_rate_hz: 12.5                 # the official client sends every 80 ms (document: 20 Hz)
-    cmd_timeout_sec: 0.5              # cmd_vel older than this: zeros
-    stop_burst_sec: 0.5               # zeros streamed after the timeout, then silence
-    auto_regular_mode: true           # request regular usage mode when motion starts in another
-    mode_refresh_sec: 2.0             # and again this often while the robot reports another
+    # of the gait's full scale. They only work in regular usage mode and move the robot in
+    # RL control (stand_up gets it there). Sent while driving, then zeros for stop_burst_sec,
+    # then nothing, even while zero Twists keep arriving.
+    cmd_rate_hz: 20.0                 # the document's rate (the official client: 12.5)
+    cmd_timeout_sec: 0.5              # cmd_vel older than this is stale (>= 2 command periods)
+    stop_burst_sec: 0.5               # zeros sent after the last motion, then silence
+    auto_regular_mode: true           # navigation mode since boot (regular never seen): ask for
+                                      # regular mode when a motion episode starts (3 tries).
+                                      # Never from assist mode and never after a takeover.
     max_vx: 1.0                       # m/s, cmd_vel is clamped to these
     max_vy: 0.5                       # m/s
     max_wz: 1.0                       # rad/s
-    # Speed at axis value 1.0. NOT in the document: high values are the safe side (the robot
-    # runs slower than asked). Calibrate: drive steadily and read full_scale_*_estimate in the
-    # diagnostics (measured speed / sent ratio), then set them here.
-    full_scale_vx: 5.0                # m/s
-    full_scale_vy: 2.0                # m/s
-    full_scale_wz: 3.0                # rad/s
+    # Speed at axis value 1.0 for each gait (the reported Gait picks one; an unknown gait uses
+    # the largest of each axis). NOT in the document: high values are the safe side (the robot
+    # runs slower than asked). Calibrate: drive steadily in each gait and read
+    # full_scale.<gait>.*_estimate in the diagnostics (reported speed / sent ratio). A reported
+    # speed above 1.3 x max_* + 0.1 for 0.5 s while driving stops the stream (overspeed).
+    full_scale:
+      basic:
+        vx: 5.0                       # m/s
+        vy: 2.0                       # m/s
+        wz: 3.0                       # rad/s
+      stair:
+        vx: 5.0
+        vy: 2.0
+        wz: 3.0
+      flat_agile:
+        vx: 5.0
+        vy: 2.0
+        wz: 3.0
+      stair_agile:
+        vx: 5.0
+        vy: 2.0
+        wz: 3.0
     invert_vy: false                  # true if +linear.y moves the robot RIGHT (checklist)
     invert_wz: false                  # true if +angular.z turns the robot RIGHT (checklist)
     follow_direction: true            # forward direction Back (hard e-stop side, basic status):
-                                      # negate X and Y so cmd_vel stays in base_link
+                                      # negate X and Y so cmd_vel stays in base_link; until a
+                                      # Direction is reported nothing but zeros is sent
+    direction_flips_reports: false    # true: the robot reports LinearX/LinearY in its forward
+                                      # direction, so they are negated while it is Back (verify)
 
     # Reports
-    angles_in_degrees: false          # Roll/Pitch/Yaw unit; switches to degrees on its own
-                                      # when a reported angle exceeds 2*pi
+    angle_unit: auto                  # Roll/Pitch/Yaw unit: rad (the document), deg (the SDK),
+                                      # auto: found from Yaw against OmegaZ during a turn
+                                      # (> 0.3 rad/s); no imu orientation until then
     odom_frame: odom
     base_frame: base_link
     imu_frame: imu_link
@@ -45,11 +69,14 @@
     state_timeout_sec: 1.5            # no status report for this long: disconnected
     low_battery: 0.2                  # 0-1, warn below
 
-    # Services
-    response_timeout_sec: 1.0         # wait for the robot's call status response
-    stand_timeout_sec: 10.0           # stand_up: Stand reached
-    rl_timeout_sec: 5.0               # stand_up: RL control reached
+    # Services: each succeeds only when the robot confirmed it (call status response; for
+    # motion states also the reported state)
+    response_timeout_sec: 1.0         # wait for the call status response
+    stand_timeout_sec: 10.0           # stand_up: Stand reported
+    rl_timeout_sec: 5.0               # stand_up / rl_control: RL control reported
+    transition_timeout_sec: 10.0      # sit_down, idle, damping, release_emergency_stop
     stand_up_gait: ''                 # after stand_up: basic, stair, flat_agile, stair_agile;
                                       # '' keeps the robot's gait (agile suits autonomy)
     sleep_auto: false                 # sleep / wake send Auto and Time as the robot reports
-    sleep_minutes: 10                 # them; these only fill in when it does not answer
+    sleep_minutes: 10                 # them (1101/7, read every time); these only fill in when
+                                      # it does not answer. Minutes in [5, 30].

@@ -131,6 +131,7 @@ class VelocityGate:
         self._sent_motion = False
         self._driving = False
         self._burst_until: Optional[float] = None
+        self._zero_owed = False                        # at least one zero after any motion
         self._last_sent: Optional[dict] = None
         self._last_sent_time: Optional[float] = None
         self._over_since: Optional[float] = None
@@ -163,11 +164,14 @@ class VelocityGate:
                 self._arm()
 
     def hold(self, reason: str, now: float):
-        """Stop driving for a service (emergency_stop, sit_down, sleep, ...): zero burst only."""
+        """
+        Stop driving for a service (emergency_stop, sit_down, sleep, ...): zero burst only.
+
+        The burst starts at the next period, so its first zero goes out however late that is.
+        """
         with self._lock:
             self._holds.add(reason)
             self._armed = False
-            self._stop_motion(now)
 
     def release(self, reasons=None) -> bool:
         """Lift the given holds (all when None); motion then needs cmd_vel zero or absent first."""
@@ -190,7 +194,6 @@ class VelocityGate:
             if not self._yield_e006:
                 self._yield_e006 = True
                 self._armed = False
-                self._stop_motion(now)
                 self._events.append((
                     'warn', 'E006: another client holds the axis channel (2 s rule): cmd_vel is '
                     f'ignored until it has been silent for {self.config.silence_sec:.1f} s'))
@@ -216,7 +219,6 @@ class VelocityGate:
             elif not self._overspeed and now - self._over_since > OVERSPEED_SEC:
                 self._overspeed = True
                 self._armed = False
-                self._stop_motion(now)
                 self._events.append((
                     'error', f'overspeed: reported {", ".join(over)} above 1.3 x max_* + 0.1 for '
                     f'{OVERSPEED_SEC:.1f} s: driving stopped. Calibrate full_scale.'
@@ -257,10 +259,11 @@ class VelocityGate:
             else:
                 self._stop_motion(now)
                 if self._burst_until is not None:
-                    if now < self._burst_until:
+                    if now < self._burst_until or self._zero_owed:
                         zero = p.axis_items()
                         out.append((p.AXIS, zero))
                         self._last_sent, self._last_sent_time = zero, now
+                        self._zero_owed = False
                     else:
                         self._burst_until = None
             self._driving = drive
@@ -285,6 +288,11 @@ class VelocityGate:
             if self._disarm is not None:
                 return f'disarmed:{self._disarm}', True
             return ('driving', False) if self._driving else ('idle', False)
+
+    def record_sent(self, items: dict, now: float):
+        """Note an axis command sent outside tick() (emergency_stop's zero); a burst stays due."""
+        with self._lock:
+            self._last_sent, self._last_sent_time = dict(items), now
 
     @property
     def last_axis(self) -> dict:
@@ -351,10 +359,11 @@ class VelocityGate:
         self._disarm = None
 
     def _stop_motion(self, now: float):
-        """Start the zero burst when the last command sent was motion."""
+        """Start the zero burst in this period when the last command sent was motion."""
         if self._sent_motion:
             self._sent_motion = False
             self._burst_until = now + self.config.stop_burst_sec
+            self._zero_owed = True
 
     def _update_view(self, view: RobotView, now: float):
         self._view = view
@@ -370,7 +379,6 @@ class VelocityGate:
         elif mode is not None and self._regular_seen and not self._latched:
             self._latched = True
             self._armed = False
-            self._stop_motion(now)
             self._events.append((
                 'warn', f'the robot left regular mode ({p.name_of(p.USAGE_MODES, mode)} mode): '
                 'takeover latched, no axis commands or mode requests until it reports regular '

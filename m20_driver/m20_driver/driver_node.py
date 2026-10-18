@@ -30,6 +30,7 @@ from m20_driver.convert import (
 from m20_driver.link import RobotLink
 from m20_driver.motion import (
     GAIT_NAMES,
+    is_motion,
     NAV_HOLDS,
     RobotView,
     SpeedEstimator,
@@ -612,6 +613,7 @@ class M20DriverNode(Node):
         self._gate.hold('emergency_stop', now)
         with self._axis_lock:
             self._link.send(p.AXIS, p.axis_items())        # the timer keeps the zero burst going
+            self._gate.record_sent(p.axis_items(), now)
         pending = []
         for i in range(ESTOP_REPEATS):
             request = self._link.submit(p.MOTION_STATE,
@@ -1104,10 +1106,10 @@ class M20DriverNode(Node):
         return status
 
     def destroy_node(self):
-        """Send zeros when axis commands went out within the last second; close the link."""
+        """Send zeros when the last axis command sent was motion (however old); close the link."""
         if self._link is not None:
             try:
-                if self._gate.sent_within(time.monotonic(), 1.0):
+                if is_motion(self._gate.last_axis):
                     with self._axis_lock:
                         for _ in range(SHUTDOWN_ZEROS):
                             self._link.send(p.AXIS, p.axis_items())
